@@ -1,0 +1,41 @@
+# render.yaml — Render Blueprint for DAO Governance Backend
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: dao-governance-backend
+    runtime: node
+    # Render deploys from repo root; rootDir tells it where the backend lives
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free          # change to "starter" for persistent instances
+    region: oregon      # closest to most US users; change as needed
+
+    # ---------- Environment Variables ----------
+    # Set these in the Render dashboard (or add sync'd values here).
+    # Never put real secrets in this file — it is committed to git.
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # MongoDB Atlas connection string
+      # Set in Render dashboard → Environment → MONGODB_URI
+      - key: MONGODB_URI
+        sync: false          # marks it as a secret; Render prompts for value
+
+      # Deployed DAOGovernor contract address
+      - key: GOVERNOR_ADDRESS
+        sync: false
+
+      # JSON-RPC endpoint (Alchemy / Infura / QuickNode URL)
+      - key: RPC_URL
+        sync: false
+
+      # Relayer wallet private key (funded on the target network)
+      - key: PRIVATE_KEY
+        sync: false
+
+    # Render auto-assigns PORT; server.js reads process.env.PORT already
+    # Health check — Render pings this to decide if the deploy succeeded
+    healthCheckPath: /health
