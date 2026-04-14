@@ -1,17 +1,27 @@
-node_modules
+# Node.js dependencies
+node_modules/
 .env
+.env.local
 
-# Hardhat files
-/cache
-/artifacts
+# Hardhat
+artifacts/
+cache/
+*.dbg.json
+
+# Build and Test outputs
+test_out.txt
+test_output.txt
+
+# Explicitly KEEP deployedAddresses.json
+!**/backend/config/deployedAddresses.json
 
 # TypeChain files
-/typechain
-/typechain-types
+typechain/
+typechain-types/
 
 # solidity-coverage files
-/coverage
-/coverage.json
+coverage/
+coverage.json
 
 # Hardhat Ignition default folder for deployments against a local node
-ignition/deployments/chain-31337
+ignition/deployments/chain-31337/
