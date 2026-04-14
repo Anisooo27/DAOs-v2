@@ -11,6 +11,7 @@ cache/
 # Build and Test outputs
 test_out.txt
 test_output.txt
+dist/
 
 # Explicitly KEEP deployedAddresses.json
 !**/backend/config/deployedAddresses.json
