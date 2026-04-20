@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Send, FileText, Wallet, RefreshCw } from 'lucide-react';
+import { Send, FileText, Wallet, ArrowDownLeft, ArrowUpRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { ethers } from 'ethers';
 
@@ -16,13 +16,16 @@ const CreateProposal = ({ provider, address }) => {
     tokenAddress: null
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [delegationStatus, setDelegationStatus] = useState(null); // null = checking, true/false = result
-  const [votingPower, setVotingPower] = useState(null);           // null = checking, '0' = none
+  const [delegationStatus, setDelegationStatus] = useState(null);
+  const [votingPower, setVotingPower] = useState(null);
   const [targetDelegationStatus, setTargetDelegationStatus] = useState(null);
   const [recipientDelegationStatus, setRecipientDelegationStatus] = useState(null);
   const [isCheckingProposer, setIsCheckingProposer] = useState(false);
   const [isCheckingTarget, setIsCheckingTarget] = useState(false);
   const [isCheckingRecipient, setIsCheckingRecipient] = useState(false);
+  // 'withdraw' = Treasury → Wallet (withdrawETH calldata, value=0)
+  // 'deposit'  = Wallet  → Treasury (empty calldata, value=amount)
+  const [txDirection, setTxDirection] = useState('withdraw');
   
   const navigate = useNavigate();
 
@@ -194,16 +197,15 @@ const CreateProposal = ({ provider, address }) => {
       setIsSubmitting(true);
       
       if (isWithdrawalMode) {
-        // Recipient only needs to be a valid address — NO delegation required.
-        // Governance policy: only the proposer must be delegated.
-        if (!ethers.isAddress(recipient)) {
+        // For deposit: no recipient field — the target IS the recipient.
+        // For withdraw: recipient must be a valid Ethereum address.
+        if (txDirection === 'withdraw' && !ethers.isAddress(recipient)) {
           throw new Error('Invalid recipient address');
         }
         if (!amount || parseFloat(amount) <= 0) {
-          throw new Error('A positive amount is required for withdrawals');
+          throw new Error('A positive amount is required');
         }
       } else {
-        // Not in withdrawal mode — check target is valid
         if (targetAddress.trim() !== '' && !isTreasuryTarget && targetDelegationStatus === false) {
           throw new Error('Target address is not delegated and is not the Treasury.');
         }
@@ -216,28 +218,37 @@ const CreateProposal = ({ provider, address }) => {
       let finalValue = value;
 
       if (isWithdrawalMode) {
-        if (!recipient || !amount) {
-          throw new Error("Recipient and Amount are required for withdrawals");
+        // For deposit we only need amount; recipient is derived from target.
+        if (txDirection === 'withdraw' && (!recipient || !ethers.isAddress(recipient))) {
+          throw new Error('Recipient address is required for withdrawals');
         }
-        
-        // Explicitly following the requested encoding pattern
-        const iface = new ethers.Interface([
-          "function withdrawETH(address payable to, uint256 amount)"
-        ]);
-        
-        finalCalldata = iface.encodeFunctionData("withdrawETH", [
-          recipient,
-          ethers.parseEther(amount.toString())
-        ]);
-        
-        finalValue = "0"; 
-        
-        console.log("Withdrawal Encoded:", {
-          target: targetAddress.trim(),
-          recipient,
-          amount,
-          calldata: finalCalldata
-        });
+        if (!amount) throw new Error('Amount is required');
+
+        if (txDirection === 'deposit') {
+          // ── DEPOSIT: Wallet → Treasury ──────────────────────────────────────
+          // Empty calldata; ETH amount is set as the proposal `value` field.
+          // The Governor will call treasury.receive{value: amountWei}() via the
+          // Timelock. The relayer wallet supplies the ETH in the execute() tx.
+          finalCalldata = '0x';
+          finalValue = amount; // will be parseEther'd in the propose() call below
+          console.log('Deposit Encoded:', { target: targetAddress.trim(), amount, value: finalValue });
+
+        } else {
+          // ── WITHDRAW: Treasury → Wallet ─────────────────────────────────────
+          // Encode withdrawETH(address payable to, uint256 amount).
+          // value=0 because the Treasury itself holds the ETH to be sent.
+          const iface = new ethers.Interface([
+            'function withdrawETH(address payable to, uint256 amount)'
+          ]);
+          finalCalldata = iface.encodeFunctionData('withdrawETH', [
+            recipient,
+            ethers.parseEther(amount.toString())
+          ]);
+          finalValue = '0';
+          console.log('Withdrawal Encoded:', {
+            target: targetAddress.trim(), recipient, amount, calldata: finalCalldata
+          });
+        }
       }
 
       const message = JSON.stringify({
@@ -327,9 +338,7 @@ const CreateProposal = ({ provider, address }) => {
 
       const response = await fetch('http://localhost:5000/propose', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           proposalId: onChainProposalId,
           proposerAddress: address,
@@ -337,8 +346,13 @@ const CreateProposal = ({ provider, address }) => {
           target: targetAddress.trim(),
           value: finalValue.toString(),
           calldata: finalCalldata,
-          recipient: isWithdrawalMode ? recipient : undefined,
+          // For deposits: recipient = target (Treasury receives the ETH).
+          // For withdrawals: recipient = the wallet address entered by user.
+          recipient: isWithdrawalMode
+            ? (txDirection === 'deposit' ? targetAddress.trim() : recipient)
+            : undefined,
           amount: isWithdrawalMode ? amount : undefined,
+          direction: isWithdrawalMode ? txDirection : 'custom',
           signature
         })
       });
@@ -375,11 +389,14 @@ const CreateProposal = ({ provider, address }) => {
   const targetFieldOk = targetAddress.trim() !== '' && (isTreasuryTarget || targetDelegationStatus === true);
   const targetOk = descriptionOk && targetFieldOk;
 
-  // recipientOk: only needs a valid Ethereum address + positive amount.
-  // Delegation is NOT required — any address can receive funds.
+  // recipientOk: direction-aware.
+  // - Not in withdrawal mode → always ok (no recipient field shown).
+  // - deposit: only need a positive amount (recipient = target; auto-set in submit).
+  // - withdraw: need a valid recipient address + positive amount.
   const recipientOk = !isWithdrawalMode || (
-    ethers.isAddress(recipient.trim()) &&
-    !!amount && parseFloat(amount) > 0
+    txDirection === 'deposit'
+      ? (!!amount && parseFloat(amount) > 0)
+      : (ethers.isAddress(recipient.trim()) && !!amount && parseFloat(amount) > 0)
   );
 
   const isAnyChecking = proposerChecking || isCheckingTarget || isCheckingRecipient;
@@ -419,12 +436,12 @@ const CreateProposal = ({ provider, address }) => {
               required
               style={isWithdrawalMode ? { borderColor: 'var(--accent-primary)', boxShadow: '0 0 10px rgba(0, 255, 136, 0.2)', padding: '12px' } : { padding: '12px' }}
             />
-            {isWithdrawalMode && (
-              <div className="mt-2 text-xs flex items-center gap-1" style={{ color: 'var(--accent-primary)', fontWeight: 600, marginTop: '8px' }}>
-                <Wallet size={12} />
-                {isTreasuryTarget ? 'TREASURY DETECTED — WITHDRAWAL MODE ENABLED' : 'DELEGATED TARGET DETECTED — WITHDRAWAL MODE ENABLED'}
-              </div>
-            )}
+          {isWithdrawalMode && (
+            <div className="mt-2 text-xs flex items-center gap-1" style={{ color: 'var(--accent-primary)', fontWeight: 600, marginTop: '8px' }}>
+              <Wallet size={12} />
+              {isTreasuryTarget ? 'TREASURY DETECTED — CHOOSE DIRECTION BELOW' : 'DELEGATED TARGET DETECTED — WITHDRAWAL MODE ENABLED'}
+            </div>
+          )}
             {!isWithdrawalMode && targetAddress.trim() !== '' && !isCheckingTarget && targetDelegationStatus === false && (
               <div style={{ color: 'var(--danger)', fontSize: '0.85rem', marginTop: '8px', fontWeight: 500 }}>
                 ⚠️ Target address not delegated.
@@ -434,59 +451,125 @@ const CreateProposal = ({ provider, address }) => {
 
           {isWithdrawalMode ? (
             <div className="glass-panel mt-6" style={{ border: '1px solid var(--accent-primary)', background: 'rgba(0, 255, 136, 0.05)', padding: '28px' }}>
-              <div className="flex items-center gap-2 mb-6">
-                <div style={{ padding: '6px', background: 'var(--accent-primary)', borderRadius: '4px', color: '#000' }}>
-                  <Send size={14} />
-                </div>
-                <h3 style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--accent-primary)' }}>Withdrawal Configuration</h3>
+              {/* Direction toggle */}
+              <div style={{ display: 'flex', gap: '12px', marginBottom: '24px' }}>
+                <button
+                  type="button"
+                  onClick={() => setTxDirection('withdraw')}
+                  style={{
+                    flex: 1, padding: '10px 16px', borderRadius: '8px', fontWeight: 700,
+                    fontSize: '0.85rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                    border: txDirection === 'withdraw' ? '2px solid var(--accent-primary)' : '1px solid rgba(255,255,255,0.12)',
+                    background: txDirection === 'withdraw' ? 'rgba(0,255,136,0.08)' : 'transparent',
+                    color: txDirection === 'withdraw' ? 'var(--accent-primary)' : 'rgba(255,255,255,0.5)',
+                    cursor: 'pointer', transition: 'all 0.18s'
+                  }}
+                >
+                  <ArrowDownLeft size={15} />
+                  Withdraw
+                  <span style={{ fontSize: '0.72rem', opacity: 0.7, fontWeight: 400 }}>Treasury → Wallet</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTxDirection('deposit')}
+                  style={{
+                    flex: 1, padding: '10px 16px', borderRadius: '8px', fontWeight: 700,
+                    fontSize: '0.85rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                    border: txDirection === 'deposit' ? '2px solid #60a5fa' : '1px solid rgba(255,255,255,0.12)',
+                    background: txDirection === 'deposit' ? 'rgba(96,165,250,0.08)' : 'transparent',
+                    color: txDirection === 'deposit' ? '#60a5fa' : 'rgba(255,255,255,0.5)',
+                    cursor: 'pointer', transition: 'all 0.18s'
+                  }}
+                >
+                  <ArrowUpRight size={15} />
+                  Deposit
+                  <span style={{ fontSize: '0.72rem', opacity: 0.7, fontWeight: 400 }}>Wallet → Treasury</span>
+                </button>
               </div>
-              
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px' }}>
-                <div className="form-group">
-                  <label className="form-label" htmlFor="recipient" style={{ marginBottom: '10px', display: 'block', fontWeight: 600 }}>Recipient Address</label>
-                  <input
-                    id="recipient"
-                    type="text"
-                    className="form-input"
-                    placeholder="0x..."
-                    value={recipient}
-                    onChange={(e) => setRecipient(e.target.value)}
-                    required
-                    style={{ padding: '12px' }}
-                  />
-                  {recipientDelegationStatus === 'none' && !isCheckingRecipient && recipient.trim() !== '' ? (
-                    <div style={{ color: 'var(--accent-secondary)', fontSize: '0.78rem', marginTop: '6px' }}>
-                      ℹ️ No delegation record — that's fine. Any valid address can receive funds.
-                    </div>
-                  ) : recipientDelegationStatus === 'has-power' ? (
-                    <div style={{ color: 'var(--accent-primary)', fontSize: '0.78rem', marginTop: '6px' }}>
-                      ✅ Recipient holds GOV voting power.
-                    </div>
-                  ) : (
-                    <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>The wallet address that will receive the ETH.</p>
-                  )}
+
+              <div className="flex items-center gap-2 mb-4">
+                <div style={{ padding: '6px', background: txDirection === 'deposit' ? '#60a5fa' : 'var(--accent-primary)', borderRadius: '4px', color: '#000' }}>
+                  {txDirection === 'deposit' ? <ArrowUpRight size={14} /> : <Send size={14} />}
                 </div>
-                <div className="form-group">
-                  <label className="form-label" htmlFor="amount" style={{ marginBottom: '10px', display: 'block', fontWeight: 600 }}>Withdrawal Amount (ETH)</label>
-                  <div style={{ position: 'relative' }}>
-                    <input
-                      id="amount"
-                      type="number"
-                      step="0.01"
-                      className="form-input"
-                      placeholder="1.0"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      required
-                      style={{ paddingRight: '44px', paddingLeft: '14px', height: '48px' }}
-                    />
-                    <span style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', fontSize: '0.85rem', opacity: 0.6, fontWeight: 600 }}>ETH</span>
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, color: txDirection === 'deposit' ? '#60a5fa' : 'var(--accent-primary)' }}>
+                  {txDirection === 'deposit' ? 'Deposit Configuration' : 'Withdrawal Configuration'}
+                </h3>
+              </div>
+
+              {txDirection === 'deposit' ? (
+                /* ── DEPOSIT: only need amount ── */
+                <div style={{ maxWidth: '320px' }}>
+                  <div className="form-group">
+                    <label className="form-label" htmlFor="amount" style={{ marginBottom: '10px', display: 'block', fontWeight: 600 }}>Deposit Amount (ETH)</label>
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        id="amount"
+                        type="number"
+                        step="0.01"
+                        className="form-input"
+                        placeholder="1.0"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        required
+                        style={{ paddingRight: '44px', paddingLeft: '14px', height: '48px' }}
+                      />
+                      <span style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', fontSize: '0.85rem', opacity: 0.6, fontWeight: 600 }}>ETH</span>
+                    </div>
+                    <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>
+                      ETH will be forwarded from the relayer wallet into the target contract via the Governor.
+                    </p>
                   </div>
-                  <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>Amount to transfer from the target contract.</p>
                 </div>
-              </div>
+              ) : (
+                /* ── WITHDRAW: need recipient + amount ── */
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px' }}>
+                  <div className="form-group">
+                    <label className="form-label" htmlFor="recipient" style={{ marginBottom: '10px', display: 'block', fontWeight: 600 }}>Recipient Address</label>
+                    <input
+                      id="recipient"
+                      type="text"
+                      className="form-input"
+                      placeholder="0x..."
+                      value={recipient}
+                      onChange={(e) => setRecipient(e.target.value)}
+                      required={txDirection === 'withdraw'}
+                      style={{ padding: '12px' }}
+                    />
+                    {recipientDelegationStatus === 'none' && !isCheckingRecipient && recipient.trim() !== '' ? (
+                      <div style={{ color: 'var(--accent-secondary)', fontSize: '0.78rem', marginTop: '6px' }}>
+                        ℹ️ No delegation record — that’s fine. Any valid address can receive funds.
+                      </div>
+                    ) : recipientDelegationStatus === 'has-power' ? (
+                      <div style={{ color: 'var(--accent-primary)', fontSize: '0.78rem', marginTop: '6px' }}>
+                        ✅ Recipient holds GOV voting power.
+                      </div>
+                    ) : (
+                      <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>The wallet address that will receive the ETH.</p>
+                    )}
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label" htmlFor="amount" style={{ marginBottom: '10px', display: 'block', fontWeight: 600 }}>Withdrawal Amount (ETH)</label>
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        id="amount"
+                        type="number"
+                        step="0.01"
+                        className="form-input"
+                        placeholder="1.0"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        required
+                        style={{ paddingRight: '44px', paddingLeft: '14px', height: '48px' }}
+                      />
+                      <span style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', fontSize: '0.85rem', opacity: 0.6, fontWeight: 600 }}>ETH</span>
+                    </div>
+                    <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>Amount to transfer from the target contract.</p>
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
+            /* ── NON-WITHDRAWAL MODE: raw value + calldata ── */
             <div className="form-group" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
               <div>
                 <label className="form-label" htmlFor="value" style={{ marginBottom: '8px', display: 'block', fontWeight: 600 }}>Value (ETH)</label>
@@ -545,8 +628,9 @@ const CreateProposal = ({ provider, address }) => {
               : !descriptionOk ? 'Enter Proposal Description'
               : !targetAddress.trim() ? 'Enter Target Contract Address'
               : (!isWithdrawalMode && targetAddress.trim() !== '' && targetDelegationStatus === false) ? 'Target address not delegated'
-              : (isWithdrawalMode && (!recipient.trim() || !ethers.isAddress(recipient.trim()))) ? 'Enter a valid Recipient Address'
-              : (isWithdrawalMode && (!amount || parseFloat(amount) <= 0)) ? 'Enter Withdrawal Amount'
+              : (isWithdrawalMode && txDirection === 'withdraw' && (!recipient.trim() || !ethers.isAddress(recipient.trim()))) ? 'Enter a valid Recipient Address'
+              : (isWithdrawalMode && (!amount || parseFloat(amount) <= 0)) ? `Enter ${txDirection === 'deposit' ? 'Deposit' : 'Withdrawal'} Amount`
+              : txDirection === 'deposit' ? 'Submit Deposit Proposal'
               : 'Submit Proposal'}
           </button>
 
@@ -572,19 +656,25 @@ const CreateProposal = ({ provider, address }) => {
                 title={
                   !isWithdrawalMode
                     ? 'No recipient required for this target.'
-                    : !recipient.trim() || !ethers.isAddress(recipient.trim())
-                    ? 'Enter a valid recipient address (any Ethereum address is accepted).'
-                    : !amount || parseFloat(amount) <= 0
-                    ? 'Enter a positive withdrawal amount.'
-                    : recipientDelegationStatus === 'has-power'
-                    ? 'Recipient has on-chain voting power (GOV delegated).'
-                    : recipientDelegationStatus === 'record-only'
-                    ? 'Recipient has a delegation record but 0 on-chain votes. This is OK — recipients do not need to be delegated.'
-                    : 'Valid recipient address. Note: Recipients do not need to hold GOV tokens.'
+                    : txDirection === 'deposit'
+                    ? (!amount || parseFloat(amount) <= 0
+                        ? 'Enter a positive deposit amount. Funds will be sent to the target contract.'
+                        : `✅ Deposit ${amount} ETH into ${targetAddress.slice(0,8)}...`)
+                    : (!recipient.trim() || !ethers.isAddress(recipient.trim())
+                        ? 'Enter a valid recipient address (any Ethereum address is accepted).'
+                        : !amount || parseFloat(amount) <= 0
+                        ? 'Enter a positive withdrawal amount.'
+                        : recipientDelegationStatus === 'has-power'
+                        ? 'Recipient has on-chain voting power (GOV delegated).'
+                        : recipientDelegationStatus === 'record-only'
+                        ? 'Recipient has a delegation record but 0 on-chain votes. This is OK — recipients do not need to be delegated.'
+                        : 'Valid recipient address. Note: Recipients do not need to hold GOV tokens.')
                 }
               >
                 <span style={{ fontSize: '1.1rem' }}>{isCheckingRecipient ? '⏳' : recipientOk ? '✅' : (!isWithdrawalMode ? '➖' : '❌')}</span>
-                <span style={{ fontSize: '0.75rem', fontWeight: 600, opacity: 0.65, color: recipientOk ? 'var(--accent-primary)' : (!isWithdrawalMode ? 'inherit' : 'var(--danger)') }}>Recipient</span>
+                <span style={{ fontSize: '0.75rem', fontWeight: 600, opacity: 0.65, color: recipientOk ? 'var(--accent-primary)' : (!isWithdrawalMode ? 'inherit' : 'var(--danger)') }}>
+                  {txDirection === 'deposit' ? 'Deposit' : 'Recipient'}
+                </span>
               </div>
             </div>
           </div>

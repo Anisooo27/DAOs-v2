@@ -284,7 +284,7 @@ app.post('/delegate', async (req, res) => {
 // 0.5 POST /propose
 app.post('/propose', async (req, res) => {
   try {
-    const { proposalId, proposerAddress, description, target, value, calldata, recipient, amount, signature } = req.body;
+    const { proposalId, proposerAddress, description, target, value, calldata, recipient, amount, signature, direction } = req.body;
     if (!proposalId || !proposerAddress || !description || !target || value === undefined || !calldata || !signature) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -383,7 +383,8 @@ app.post('/propose', async (req, res) => {
       calldata: normalizedSaveCalldata,
       recipient,
       amount,
-      signature
+      signature,
+      direction: direction || 'withdraw',
     });
     await newProposal.save();
     console.log(`[propose] Saved proposal ${shortId} (${proposalId.slice(0,10)}...). Triggering auto-tally.`);
@@ -498,8 +499,7 @@ app.post('/vote', async (req, res) => {
     return res.status(201).json({
       message: 'Vote recorded',
       secured: !!commitment,
-      nullifier: canonicalNullifier,
-      zkProofVersion: newVote.zkProofVersion
+      vote: newVote
     });
   } catch (error) {
     if (error.code === 11000) return res.status(409).json({ error: 'Already voted — duplicate nullifier rejected by database.' });
@@ -750,8 +750,9 @@ app.post('/execute/:proposalId', async (req, res) => {
 
     const result = await withSignerLock(async () => {
       const { provider, signer, governor } = await getGovernorSigner();
-      const { description, target, value, calldata, recipient } = dbProposal;
+      const { description, target, value, calldata, recipient, direction } = dbProposal;
       const descriptionHash = ethers.id(description);
+      const isDeposit = direction === 'deposit';
       const log = [];
 
       // ── Normalize calldata ──────────────────────────────────────────────────
@@ -816,18 +817,34 @@ app.post('/execute/:proposalId', async (req, res) => {
         throw Object.assign(new Error(msg), { state, userError: true });
       }
 
-      // Queue — nonce N
+      // ── Pre-flight: relayer balance check for deposit proposals ────────────
+      if (isDeposit && proposalValue > 0n) {
+        const relayerBal = await provider.getBalance(signer.address);
+        if (relayerBal < proposalValue) {
+          throw Object.assign(
+            new Error(`Relayer has insufficient ETH for deposit: needs ${ethers.formatEther(proposalValue)} ETH, has ${ethers.formatEther(relayerBal)} ETH.`),
+            { userError: true }
+          );
+        }
+        console.log(`[execute] Deposit proposal — relayer will forward ${ethers.formatEther(proposalValue)} ETH.`);
+      }
+
+      // Queue — OZ Governor.queue() does NOT accept msg.value.
+      // ETH is only required at execute() time, where the Timelock forwards it to the target.
       log.push('Queueing in Timelock...');
       console.log(`[execute] ${log[log.length - 1]}`);
       let queueNonceConsumed = false;
       try {
-        const { tx: qTx } = await nm.sendTx(governor, 'queue', [[target], [proposalValue], [normalizedCalldata], descriptionHash]);
+        const { tx: qTx } = await nm.sendTx(
+          governor, 'queue',
+          [[target], [proposalValue], [normalizedCalldata], descriptionHash]
+          // Note: no {value} override — queue() does not forward ETH
+        );
         log.push(`Queued. Tx: ${qTx.hash}`);
         console.log(`[execute] Queued: ${qTx.hash}`);
         queueNonceConsumed = true;
       } catch (qErr) {
         if (!qErr.message.includes('NotSuccessful') && !qErr.message.includes('already queued')) throw qErr;
-        // Queue tx was NOT submitted — un-consume the nonce so execute() gets the right one
         nm._nonce--;
         log.push('Already queued (nonce not consumed — rolling back).');
         console.log('[execute] Already queued — nonce rolled back.');
@@ -848,46 +865,64 @@ app.post('/execute/:proposalId', async (req, res) => {
         throw Object.assign(new Error(`Expected Queued (5), got ${state} (${stateLabel(state)})`), { state });
       }
 
+      // ── ETH Transfer Proof: decide which address to track ──────────────────
+      // withdraw: Treasury → recipient wallet  →  track recipient
+      // deposit:  proposer → Treasury          →  track target (Treasury)
+      // custom:   depends on calldata          →  track recipient if present, else target
+      const proofAddress = isDeposit
+        ? target
+        : (recipient && ethers.isAddress(recipient) ? recipient : null);
+
       // Snapshot balance BEFORE execution — query at the latest confirmed block
-      // to avoid any cached values from the queue/increaseTime operations above.
       let balBefore = 0n;
       const blockBeforeExec = await provider.getBlockNumber();
-      if (recipient && ethers.isAddress(recipient)) {
-        balBefore = await provider.getBalance(recipient, blockBeforeExec);
-        console.log(`[execute] Balance BEFORE (block ${blockBeforeExec}): ${ethers.formatEther(balBefore)} ETH`);
-        log.push(`Recipient balance before: ${ethers.formatEther(balBefore)} ETH (block ${blockBeforeExec})`);
+      if (proofAddress) {
+        balBefore = await provider.getBalance(proofAddress, blockBeforeExec);
+        console.log(`[execute] Balance BEFORE ${isDeposit ? '(target/deposit)' : '(recipient)'} (block ${blockBeforeExec}): ${ethers.formatEther(balBefore)} ETH`);
+        log.push(`${isDeposit ? 'Target' : 'Recipient'} balance before: ${ethers.formatEther(balBefore)} ETH (block ${blockBeforeExec})`);
       }
 
       // Execute — nonce N+1 (tracked automatically by NonceManager)
+      // For deposit proposals, the ETH must be sent with this transaction so
+      // the Governor/Timelock can forward it to the target contract.
       log.push('Executing...');
       console.log(`[execute] ${log[log.length - 1]} (nonce=${nm.current()})`);
-      const { tx: exTx, receipt } = await nm.sendTx(governor, 'execute', [[target], [proposalValue], [normalizedCalldata], descriptionHash]);
+      const { tx: exTx, receipt } = await nm.sendTx(
+        governor, 'execute',
+        [[target], [proposalValue], [normalizedCalldata], descriptionHash],
+        isDeposit ? { value: proposalValue } : {}
+      );
       log.push(`✅ Executed! Tx: ${exTx.hash} | Block: ${receipt.blockNumber}`);
       console.log(`[execute] ${log[log.length - 1]}`);
 
       await Proposal.findOneAndUpdate({ proposalId }, { status: 'EXECUTED' }).catch(() => {});
 
-      // Snapshot balance AFTER — pinned to the exact block the execute tx was mined in.
-      // Using a block tag eliminates any JsonRpcProvider internal cache inconsistency.
+      // Snapshot balance AFTER — pinned to the exact execute block.
       let proof = null;
-      if (recipient && ethers.isAddress(recipient)) {
-        const balAfter = await provider.getBalance(recipient, receipt.blockNumber);
+      if (proofAddress) {
+        const balAfter = await provider.getBalance(proofAddress, receipt.blockNumber);
         const net = balAfter - balBefore;
+        const label = isDeposit ? 'Target (deposit)' : 'Recipient (withdraw)';
         proof = {
-          recipient,
+          address:       proofAddress,
+          label,
+          direction:     direction || 'withdraw',
           balanceBefore: ethers.formatEther(balBefore),
           balanceAfter:  ethers.formatEther(balAfter),
-          netChange:     ethers.formatEther(net < 0n ? -net : net),   // formatEther needs positive value
-          netSign:       net >= 0n ? '+' : '-'
+          netChange:     ethers.formatEther(net < 0n ? -net : net),
+          netSign:       net >= 0n ? '+' : '-',
+          // Keep legacy field for UI backwards compat
+          recipient:     proofAddress,
         };
         const sym = net > 0n ? '✅' : (net === 0n ? '⚠️' : '❌');
-        console.log(`\n[execute] ╔══ ETH Transfer Proof ═════════════════`);
-        console.log(`[execute] ║  Recipient:  ${recipient}`);
-        console.log(`[execute] ║  Block:      Before=${blockBeforeExec} → After=${receipt.blockNumber}`);
-        console.log(`[execute] ║  Balance:    ${proof.balanceBefore} → ${proof.balanceAfter} ETH`);
+        console.log(`\n[execute] ╔══ ETH Transfer Proof ══════════════════════`);
+        console.log(`[execute] ║  Direction: ${isDeposit ? 'DEPOSIT (Wallet → Treasury)' : 'WITHDRAW (Treasury → Wallet)'}`);
+        console.log(`[execute] ║  ${label}: ${proofAddress}`);
+        console.log(`[execute] ║  Block:     Before=${blockBeforeExec} → After=${receipt.blockNumber}`);
+        console.log(`[execute] ║  Balance:   ${proof.balanceBefore} → ${proof.balanceAfter} ETH`);
         console.log(`[execute] ║  Net Change: ${proof.netSign}${proof.netChange} ETH  ${sym}`);
-        console.log(`[execute] ╚══════════════════════════════════════`);
-        log.push(`${sym} ${recipient}: ${proof.balanceBefore} → ${proof.balanceAfter} ETH (${proof.netSign}${proof.netChange} ETH)`);
+        console.log(`[execute] ╚═══════════════════════════════════════════════`);
+        log.push(`${sym} [${label}] ${proofAddress}: ${proof.balanceBefore} → ${proof.balanceAfter} ETH (${proof.netSign}${proof.netChange} ETH)`);
       }
 
       return { txHash: exTx.hash, proof, log };

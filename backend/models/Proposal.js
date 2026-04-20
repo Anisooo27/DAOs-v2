@@ -52,6 +52,14 @@ const proposalSchema = new mongoose.Schema({
     type: String,
     enum: ['ACTIVE', 'SUCCEEDED', 'QUEUED', 'EXECUTED'],
     default: 'ACTIVE',
+  },
+  // 'withdraw' = Treasury → Wallet (withdrawETH calldata, value=0)
+  // 'deposit'  = Wallet  → Treasury (empty calldata, value=amountWei)
+  // 'custom'   = raw calldata + value set by user
+  direction: {
+    type: String,
+    enum: ['withdraw', 'deposit', 'custom'],
+    default: 'withdraw',
   }
 });
 
