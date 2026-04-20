@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { Wallet } from 'lucide-react';
+import { Wallet, LogOut } from 'lucide-react';
 
-const WalletConnect = ({ address, onConnect }) => {
+const WalletConnect = ({ address, onConnect, onDisconnect }) => {
   const [isConnecting, setIsConnecting] = useState(false);
 
   const getProvider = () => {
@@ -67,15 +67,35 @@ const WalletConnect = ({ address, onConnect }) => {
     return `${addr.substring(0, 6)}...${addr.substring(addr.length - 4)}`;
   };
 
-  return (
+  return address ? (
+    <div style={{ display: 'flex', gap: '8px' }}>
+      <button className="btn btn-primary" style={{ cursor: 'default' }}>
+        <Wallet size={18} />
+        {formatAddress(address)}
+      </button>
+      <button 
+        className="btn"
+        style={{ padding: '8px 12px', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--danger)', borderColor: 'rgba(239, 68, 68, 0.2)' }}
+        onClick={() => {
+          if (window.ethereum && window.ethereum.disconnect) {
+            window.ethereum.disconnect(); // If a provider actually supports it
+          }
+          if (onDisconnect) onDisconnect();
+        }}
+        title="Disconnect Wallet"
+      >
+        <LogOut size={18} /> Disconnect
+      </button>
+    </div>
+  ) : (
     <button 
-      className={`btn ${address ? 'btn-primary' : ''}`}
+      className="btn"
       id="connect-wallet-btn"
       onClick={connectWallet}
       disabled={isConnecting}
     >
       <Wallet size={18} />
-      {isConnecting ? 'Connecting...' : address ? formatAddress(address) : 'Connect Wallet'}
+      {isConnecting ? 'Connecting...' : 'Connect Wallet'}
     </button>
   );
 };

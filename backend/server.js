@@ -48,14 +48,132 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// GET /config/contract — reads fresh from deployedAddresses.json each time
 app.get('/config/contract', (req, res) => {
   const addrs = getAddresses();
   res.json({ 
     governorAddress: addrs.governorAddress,
-    treasuryAddress: addrs.treasuryAddress
+    treasuryAddress: addrs.treasuryAddress,
+    tokenAddress: addrs.tokenAddress
   });
 });
+
+// GET /delegation/:address — full status: MongoDB + on-chain votes + GOV balance
+app.get('/delegation/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    if (!ethers.isAddress(address)) {
+      return res.status(400).json({ error: 'Invalid address' });
+    }
+
+    // 1. MongoDB record (off-chain proof used for UI gating)
+    const delegation = await Delegation.findOne({ delegatorAddress: address.toLowerCase() });
+
+    // 2. On-chain data — authoritative source for proposer check
+    let onChainVotes     = '0';
+    let govBalance       = '0';
+    let onChainVotesBigInt = 0n;
+
+    try {
+      const addrs = getAddresses();
+      if (addrs.tokenAddress) {
+        const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
+        const TOKEN_ABI = [
+          'function getVotes(address account) view returns (uint256)',
+          'function balanceOf(address account) view returns (uint256)'
+        ];
+        const tokenContract = new ethers.Contract(addrs.tokenAddress, TOKEN_ABI, rpcProvider);
+        const [votes, balance] = await Promise.all([
+          tokenContract.getVotes(address),
+          tokenContract.balanceOf(address)
+        ]);
+        onChainVotesBigInt = votes;
+        onChainVotes = votes.toString();
+        govBalance   = balance.toString();
+      }
+    } catch (chainErr) {
+      console.warn(`[delegation] on-chain query failed for ${address}:`, chainErr.message);
+    }
+
+    return res.json({
+      // MongoDB
+      delegated:         !!delegation,
+      mongoRecordExists: !!delegation,
+      delegatee:         delegation ? delegation.delegateeAddress : null,
+      // On-chain
+      govBalance,
+      onChainVotes,
+      hasVotingPower:    onChainVotesBigInt > 0n
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+
+// POST /admin/setup-voter — dev helper: transfer GOV tokens from relayer/deployer to target.
+// ⚠️  RESTRICTED to localhost/loopback — never accessible from external IPs.
+app.post('/admin/setup-voter', async (req, res) => {
+  // Guard: only allow from loopback
+  const ip = req.ip || req.connection?.remoteAddress || '';
+  const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+  if (!isLocal) {
+    return res.status(403).json({ error: 'This endpoint is only available on localhost.' });
+  }
+
+  try {
+    const { targetAddress, amount } = req.body;
+    if (!ethers.isAddress(targetAddress)) {
+      return res.status(400).json({ error: 'Invalid targetAddress' });
+    }
+    const addrs = getAddresses();
+    if (!addrs.tokenAddress) {
+      return res.status(500).json({ error: 'tokenAddress not configured in deployedAddresses.json' });
+    }
+    if (!PRIVATE_KEY) {
+      return res.status(500).json({ error: 'PRIVATE_KEY not set in backend/.env — needed to sign the transfer tx.' });
+    }
+
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    const deployer = new ethers.Wallet(PRIVATE_KEY, provider);
+
+    const TOKEN_ABI = [
+      'function balanceOf(address account) view returns (uint256)',
+      'function transfer(address to, uint256 amount) returns (bool)',
+      'function getVotes(address account) view returns (uint256)',
+    ];
+    const token = new ethers.Contract(addrs.tokenAddress, TOKEN_ABI, deployer);
+
+    const amountWei = ethers.parseEther(amount || '1000');
+    const deployerBalance = await token.balanceOf(deployer.address);
+
+    if (deployerBalance < amountWei) {
+      return res.status(400).json({
+        error: `Deployer only has ${ethers.formatEther(deployerBalance)} GOV. Reduce amount or redeploy.`
+      });
+    }
+
+    // Transfer tokens
+    const transferTx = await token.transfer(targetAddress, amountWei);
+    await transferTx.wait();
+    console.log(`[admin/setup-voter] Transferred ${amount || '1000'} GOV to ${targetAddress}. Tx: ${transferTx.hash}`);
+
+    const targetBalance = await token.balanceOf(targetAddress);
+    const targetVotes   = await token.getVotes(targetAddress);
+
+    return res.json({
+      success: true,
+      transferred: ethers.formatEther(amountWei),
+      targetBalance: ethers.formatEther(targetBalance),
+      onChainVotes: ethers.formatEther(targetVotes),
+      transferTx: transferTx.hash,
+      note: 'Tokens transferred. The target wallet must now call delegate() from the DAO Delegate Votes page.'
+    });
+  } catch (err) {
+    console.error('[admin/setup-voter] Error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTO-LIFECYCLE: immediately advance proposal to Succeeded state in background.
@@ -181,6 +299,25 @@ app.post('/propose', async (req, res) => {
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
+    // Delegation validation: Proposer MUST be delegated
+    const proposerDelegation = await Delegation.findOne({ delegatorAddress: proposerAddress.toLowerCase() });
+    if (!proposerDelegation) {
+      console.warn(`[propose] ❌ Blocked: Proposer ${proposerAddress} not delegated`);
+      return res.status(403).json({ error: 'Proposer has not delegated votes' });
+    }
+    console.log(`[propose] ✅ Proposer ${proposerAddress} delegation verified.`);
+
+    // Delegation validation: Recipient MUST be delegated if provided (withdrawal mode).
+    // NOTE: Target contract (e.g. Treasury) is intentionally exempt from delegation checks.
+    if (recipient && ethers.isAddress(recipient)) {
+      const recipientDelegation = await Delegation.findOne({ delegatorAddress: recipient.toLowerCase() });
+      if (!recipientDelegation) {
+        console.warn(`[propose] ❌ Blocked: Recipient ${recipient} not delegated`);
+        return res.status(403).json({ error: 'Recipient address has not delegated votes' });
+      }
+      console.log(`[propose] ✅ Recipient ${recipient} delegation verified.`);
+    }
+
     // Generate P-001 style short ID: count existing proposals + 1
     const count = await Proposal.countDocuments();
     const shortId = `P-${String(count + 1).padStart(3, '0')}`;
@@ -252,6 +389,12 @@ app.post('/vote', async (req, res) => {
     const recovered = ethers.verifyMessage(signedMessage, signature);
     if (recovered.toLowerCase() !== voterLower) {
       return res.status(401).json({ error: 'Signature verification failed — signed message does not match voter address.' });
+    }
+
+    // Delegation validation: Voter MUST be delegated
+    const voterDelegation = await Delegation.findOne({ delegatorAddress: voterLower });
+    if (!voterDelegation) {
+      return res.status(403).json({ error: 'Voter has not delegated votes' });
     }
 
     // ── Verification Layer 2: Commitment Integrity ───────────────────────────

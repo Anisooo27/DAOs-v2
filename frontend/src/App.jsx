@@ -9,7 +9,7 @@ import CreateProposal from './pages/CreateProposal';
 import CastVote from './pages/CastVote';
 import Results from './pages/Results';
 
-const Navigation = ({ address, setAddress, setProvider, onConnect }) => {
+const Navigation = ({ address, setAddress, setProvider, onConnect, onDisconnect }) => {
   const location = useLocation();
   const currentPath = location.pathname;
 
@@ -41,6 +41,7 @@ const Navigation = ({ address, setAddress, setProvider, onConnect }) => {
       <WalletConnect 
         address={address}
         onConnect={onConnect} 
+        onDisconnect={onDisconnect}
       />
     </nav>
   );
@@ -168,6 +169,11 @@ function App() {
     switchNetwork();
   }, []);
 
+  const handleDisconnect = useCallback(() => {
+    setAddress('');
+    setProvider(null);
+  }, []);
+
   return (
     <Router>
       <div className="app-container">
@@ -176,6 +182,7 @@ function App() {
           setAddress={setAddress} 
           setProvider={setProvider} 
           onConnect={handleConnect}
+          onDisconnect={handleDisconnect}
         />
         
         <main style={{ paddingBottom: '80px' }}>

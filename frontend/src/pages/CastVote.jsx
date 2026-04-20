@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ethers } from 'ethers';
 import { CheckCircle, XCircle, MinusCircle, ShieldCheck, Lock } from 'lucide-react';
@@ -52,6 +52,38 @@ const CastVote = ({ provider, address }) => {
   const [isCasting, setIsCasting]   = useState(false);
   const [status, setStatus]         = useState(null);
   const [proofDetails, setProofDetails] = useState(null);
+  const [delegationStatus, setDelegationStatus] = useState(false);
+  const [votingPower, setVotingPower] = useState('0');
+
+  useEffect(() => {
+    const fetchStatus = async () => {
+      if (!address) return;
+      try {
+        const configRes = await fetch('http://localhost:5000/config/contract');
+        const configData = await configRes.json();
+
+        // 1. Backend Delegation Status
+        const delRes = await fetch(`http://localhost:5000/delegation/${address}`);
+        if (delRes.ok) {
+          const delData = await delRes.json();
+          setDelegationStatus(delData.delegated);
+        }
+
+        // 2. On-chain Voting Power
+        if (provider && configData.tokenAddress) {
+          const signer = await provider.getSigner();
+          const tokenContract = new ethers.Contract(configData.tokenAddress, [
+            "function getVotes(address account) view returns (uint256)"
+          ], signer);
+          const votes = await tokenContract.getVotes(address);
+          setVotingPower(votes.toString());
+        }
+      } catch (err) {
+        console.error("Error fetching voting status:", err);
+      }
+    };
+    fetchStatus();
+  }, [address, provider]);
 
   const OPTIONS = [
     { id: 0, label: 'Against', icon: XCircle,      color: 'var(--danger)'     },
@@ -200,11 +232,11 @@ const CastVote = ({ provider, address }) => {
         <button
           onClick={handleSignAndVote}
           className="btn btn-primary"
-          style={{ width: '100%', padding: '16px', fontSize: '1.05rem' }}
-          disabled={isCasting || choice === null || !proposalId || !address}
+          style={{ width: '100%', padding: '16px', fontSize: '1.05rem', opacity: (!address || !delegationStatus || votingPower === '0') ? 0.6 : 1 }}
+          disabled={isCasting || choice === null || !proposalId || !address || !delegationStatus || votingPower === '0'}
         >
           <ShieldCheck size={18} style={{ marginRight: '8px' }} />
-          {isCasting ? 'Generating proof & waiting for signature…' : 'Generate Proof & Submit Vote'}
+          {isCasting ? 'Generating proof & waiting for signature…' : !address ? 'Please connect a wallet to continue' : (!delegationStatus || votingPower === '0') ? 'No Voting Power / Not Delegated' : 'Generate Proof & Submit Vote'}
         </button>
 
         {status && (

@@ -141,4 +141,25 @@ contract DAOGovernor is
     {
         return super.supportsInterface(interfaceId);
     }
+
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public override(Governor, IGovernor) returns (uint256) {
+        require(token.getVotes(msg.sender) > 0, "No voting power: wallet has not delegated");
+        return super.propose(targets, values, calldatas, description);
+    }
+
+    function _castVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        string memory reason,
+        bytes memory params
+    ) internal override(Governor) returns (uint256) {
+        require(token.getVotes(account) > 0, "No voting power: wallet has not delegated");
+        return super._castVote(proposalId, account, support, reason, params);
+    }
 }
