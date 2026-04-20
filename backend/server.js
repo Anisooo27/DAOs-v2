@@ -299,24 +299,69 @@ app.post('/propose', async (req, res) => {
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // Delegation validation: Proposer MUST be delegated
-    const proposerDelegation = await Delegation.findOne({ delegatorAddress: proposerAddress.toLowerCase() });
-    if (!proposerDelegation) {
-      console.warn(`[propose] ❌ Blocked: Proposer ${proposerAddress} not delegated`);
-      return res.status(403).json({ error: 'Proposer has not delegated votes' });
+    // ── Address normalization ─────────────────────────────────────────────────
+    // Use ethers.getAddress() (EIP-55 checksum) before all comparisons/lookups
+    // to prevent mixed-case mismatches in MongoDB.
+    let normalizedProposer, normalizedTarget, normalizedRecipient;
+    try {
+      normalizedProposer = ethers.getAddress(proposerAddress);
+      normalizedTarget   = ethers.getAddress(target);
+      normalizedRecipient = recipient && ethers.isAddress(recipient) ? ethers.getAddress(recipient) : null;
+    } catch (addrErr) {
+      return res.status(400).json({ error: `Invalid address: ${addrErr.message}` });
     }
-    console.log(`[propose] ✅ Proposer ${proposerAddress} delegation verified.`);
 
-    // Delegation validation: Recipient MUST be delegated if provided (withdrawal mode).
-    // NOTE: Target contract (e.g. Treasury) is intentionally exempt from delegation checks.
-    if (recipient && ethers.isAddress(recipient)) {
-      const recipientDelegation = await Delegation.findOne({ delegatorAddress: recipient.toLowerCase() });
-      if (!recipientDelegation) {
-        console.warn(`[propose] ❌ Blocked: Recipient ${recipient} not delegated`);
-        return res.status(403).json({ error: 'Recipient address has not delegated votes' });
-      }
-      console.log(`[propose] ✅ Recipient ${recipient} delegation verified.`);
+    // ── Rule 1: Proposer MUST have a MongoDB delegation record ───────────────
+    const proposerDelegation = await Delegation.findOne({
+      delegatorAddress: normalizedProposer.toLowerCase()
+    });
+    if (!proposerDelegation) {
+      console.warn(`[propose] ❌ Proposer ${normalizedProposer} — no MongoDB delegation record`);
+      return res.status(403).json({ error: 'Proposer has not delegated votes. Go to the Delegate Votes page first.' });
     }
+
+    // ── Rule 2: Proposer MUST have on-chain voting power ─────────────────────
+    try {
+      const addrs = getAddresses();
+      if (addrs.tokenAddress) {
+        const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
+        const tokenContract = new ethers.Contract(addrs.tokenAddress, [
+          'function getVotes(address account) view returns (uint256)'
+        ], rpcProvider);
+        const onChainVotes = await tokenContract.getVotes(normalizedProposer);
+        if (onChainVotes === 0n) {
+          console.warn(`[propose] ❌ Proposer ${normalizedProposer} — MongoDB record exists but on-chain votes = 0`);
+          return res.status(403).json({
+            error: 'Proposer has a delegation record but 0 on-chain votes. Re-delegate via the Delegate Votes page.'
+          });
+        }
+        console.log(`[propose] ✅ Proposer ${normalizedProposer} — delegation verified (on-chain votes: ${onChainVotes.toString()})`);
+      } else {
+        console.warn('[propose] tokenAddress not configured — skipping on-chain votes check');
+      }
+    } catch (chainErr) {
+      // Non-fatal: log and continue (don't block if RPC is unavailable)
+      console.warn(`[propose] on-chain votes check failed (non-fatal):`, chainErr.message);
+    }
+
+    // ── Rule 3: Recipient validation — NO delegation required ────────────────
+    // Any valid Ethereum address may receive funds. Treasury, EOAs, and other
+    // contracts are all accepted. We log for audit but never block on this.
+    if (normalizedRecipient) {
+      const recipientDelegation = await Delegation.findOne({
+        delegatorAddress: normalizedRecipient.toLowerCase()
+      });
+      console.log(
+        `[propose] ℹ️  Recipient ${normalizedRecipient} — delegation record: ${!!recipientDelegation} (informational only, not blocking)`
+      );
+    }
+
+    const addrs = getAddresses();
+    const treasuryAddr = addrs.treasuryAddress || process.env.TREASURY_ADDRESS;
+    console.log(
+      `[propose] ✅ All checks passed — target: ${normalizedTarget}` +
+      (treasuryAddr && normalizedTarget.toLowerCase() === treasuryAddr.toLowerCase() ? ' [Treasury — exempt from delegation check]' : '')
+    );
 
     // Generate P-001 style short ID: count existing proposals + 1
     const count = await Proposal.countDocuments();

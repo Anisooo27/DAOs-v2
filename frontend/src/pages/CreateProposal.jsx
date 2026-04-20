@@ -132,30 +132,36 @@ const CreateProposal = ({ provider, address }) => {
     return () => clearTimeout(timeoutId);
   }, [targetAddress, contractConfig.treasuryAddress]);
 
-  // 2. Check Recipient Delegation (only if in Withdrawal Mode)
+  // 2. Check Recipient (informational only — delegation NOT required for recipients)
+  // We still query the backend to show a helpful tooltip, but a missing record
+  // DOES NOT block submission. Recipients can be any valid address (EOA, Treasury, etc.)
   useEffect(() => {
-    const checkRecipientDelegation = async () => {
-      if (!isWithdrawalMode || !recipient || !ethers.isAddress(recipient)) {
+    const checkRecipientInfo = async () => {
+      const trimmed = recipient.trim();
+      if (!isWithdrawalMode || !trimmed || !ethers.isAddress(trimmed)) {
         setRecipientDelegationStatus(null);
         return;
       }
       try {
         setIsCheckingRecipient(true);
-        const res = await fetch(`http://localhost:5000/delegation/${recipient}`);
+        // Normalize address before lookup to avoid checksum mismatches
+        const normalized = ethers.getAddress(trimmed);
+        const res = await fetch(`http://localhost:5000/delegation/${normalized}`);
         if (res.ok) {
           const data = await res.json();
-          setRecipientDelegationStatus(data.delegated);
+          // Store full enriched data; true = has voting power, false = no record/no power
+          setRecipientDelegationStatus(data.hasVotingPower === true ? 'has-power' : data.mongoRecordExists ? 'record-only' : 'none');
         } else {
-          setRecipientDelegationStatus(false);
+          setRecipientDelegationStatus('none');
         }
       } catch (err) {
-        console.error("Error checking recipient delegation:", err);
-        setRecipientDelegationStatus(false);
+        console.warn('Recipient info check failed (non-critical):', err.message);
+        setRecipientDelegationStatus('none');
       } finally {
         setIsCheckingRecipient(false);
       }
     };
-    const timeoutId = setTimeout(checkRecipientDelegation, 500);
+    const timeoutId = setTimeout(checkRecipientInfo, 500);
     return () => clearTimeout(timeoutId);
   }, [recipient, isWithdrawalMode]);
 
@@ -188,19 +194,18 @@ const CreateProposal = ({ provider, address }) => {
       setIsSubmitting(true);
       
       if (isWithdrawalMode) {
+        // Recipient only needs to be a valid address — NO delegation required.
+        // Governance policy: only the proposer must be delegated.
         if (!ethers.isAddress(recipient)) {
-          throw new Error("Invalid recipient address");
+          throw new Error('Invalid recipient address');
         }
-        if (recipientDelegationStatus === false) {
-          throw new Error("Recipient address has not delegated votes. Withdrawal blocked.");
-        }
-        if (!amount) {
-          throw new Error("Amount is required for withdrawals");
+        if (!amount || parseFloat(amount) <= 0) {
+          throw new Error('A positive amount is required for withdrawals');
         }
       } else {
-        // Not in withdrawal mode - check if target is valid
+        // Not in withdrawal mode — check target is valid
         if (targetAddress.trim() !== '' && !isTreasuryTarget && targetDelegationStatus === false) {
-          throw new Error("Target address is not delegated and is not the Treasury.");
+          throw new Error('Target address is not delegated and is not the Treasury.');
         }
       }
       
@@ -357,20 +362,23 @@ const CreateProposal = ({ provider, address }) => {
     }
   };
 
-  // --- Refined Validation Booleans ---
-  // Still loading if either check is in flight or hasn't resolved yet
+  // --- Validation Booleans ---
+  // proposerChecking: true while async checks are in flight
   const proposerChecking = isCheckingProposer || (!!address && delegationStatus === null) || (!!address && !!contractConfig.tokenAddress && votingPower === null);
-  // proposerOk: MongoDB delegation AND on-chain votes > 0
-  // If still loading, treat as not-ok (button stays disabled, message shows 'Verifying...')
+
+  // proposerOk: ONLY check the connected wallet has on-chain voting power.
+  // This is the single gating requirement for proposal creation.
   const proposerOk = !!address && delegationStatus === true && votingPower !== null && votingPower !== '0';
-  // targetOk: Treasury always valid; other addresses must be delegated. Description must also be filled.
+
+  // targetOk: Treasury always valid; other addresses must have a delegation record.
   const descriptionOk = description.trim() !== '';
   const targetFieldOk = targetAddress.trim() !== '' && (isTreasuryTarget || targetDelegationStatus === true);
   const targetOk = descriptionOk && targetFieldOk;
-  // recipientOk: if withdrawal mode active, need valid delegated address + positive amount
+
+  // recipientOk: only needs a valid Ethereum address + positive amount.
+  // Delegation is NOT required — any address can receive funds.
   const recipientOk = !isWithdrawalMode || (
-    ethers.isAddress(recipient) &&
-    recipientDelegationStatus === true &&
+    ethers.isAddress(recipient.trim()) &&
     !!amount && parseFloat(amount) > 0
   );
 
@@ -444,11 +452,15 @@ const CreateProposal = ({ provider, address }) => {
                     value={recipient}
                     onChange={(e) => setRecipient(e.target.value)}
                     required
-                    style={{ padding: '12px', borderColor: recipientDelegationStatus === false ? 'var(--danger)' : 'var(--panel-border)' }}
+                    style={{ padding: '12px' }}
                   />
-                  {recipientDelegationStatus === false && !isCheckingRecipient && recipient.trim() !== '' ? (
-                    <div style={{ color: 'var(--danger)', fontSize: '0.8rem', marginTop: '6px', fontWeight: 500 }}>
-                      ⚠️ Recipient address not delegated.
+                  {recipientDelegationStatus === 'none' && !isCheckingRecipient && recipient.trim() !== '' ? (
+                    <div style={{ color: 'var(--accent-secondary)', fontSize: '0.78rem', marginTop: '6px' }}>
+                      ℹ️ No delegation record — that's fine. Any valid address can receive funds.
+                    </div>
+                  ) : recipientDelegationStatus === 'has-power' ? (
+                    <div style={{ color: 'var(--accent-primary)', fontSize: '0.78rem', marginTop: '6px' }}>
+                      ✅ Recipient holds GOV voting power.
                     </div>
                   ) : (
                     <p className="text-muted mt-2" style={{ fontSize: '0.75rem' }}>The wallet address that will receive the ETH.</p>
@@ -526,15 +538,14 @@ const CreateProposal = ({ provider, address }) => {
           >
             <Send size={18} />
             {isSubmitting ? 'Submitting...'
-              : isAnyChecking ? 'Verifying Blockchain Details...'
+              : isAnyChecking ? 'Verifying Details...'
               : !address ? 'Please connect a wallet to continue'
               : (delegationStatus === false) ? 'You must delegate before proposing'
               : (votingPower === '0') ? 'You must delegate before proposing'
               : !descriptionOk ? 'Enter Proposal Description'
               : !targetAddress.trim() ? 'Enter Target Contract Address'
               : (!isWithdrawalMode && targetAddress.trim() !== '' && targetDelegationStatus === false) ? 'Target address not delegated'
-              : (isWithdrawalMode && (!recipient || !ethers.isAddress(recipient))) ? 'Enter Recipient Address'
-              : (isWithdrawalMode && recipientDelegationStatus === false) ? 'Recipient address not delegated'
+              : (isWithdrawalMode && (!recipient.trim() || !ethers.isAddress(recipient.trim()))) ? 'Enter a valid Recipient Address'
               : (isWithdrawalMode && (!amount || parseFloat(amount) <= 0)) ? 'Enter Withdrawal Amount'
               : 'Submit Proposal'}
           </button>
@@ -558,7 +569,19 @@ const CreateProposal = ({ provider, address }) => {
               </div>
               <div
                 style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', cursor: 'help' }}
-                title={!isWithdrawalMode ? 'No recipient required for this target.' : recipientOk ? 'Recipient is delegated.' : (!recipient || !ethers.isAddress(recipient)) ? 'Enter a valid recipient address.' : (recipientDelegationStatus === false ? 'Recipient has not delegated.' : (!amount || parseFloat(amount) <= 0) ? 'Enter a positive withdrawal amount.' : 'Verifying recipient...')}
+                title={
+                  !isWithdrawalMode
+                    ? 'No recipient required for this target.'
+                    : !recipient.trim() || !ethers.isAddress(recipient.trim())
+                    ? 'Enter a valid recipient address (any Ethereum address is accepted).'
+                    : !amount || parseFloat(amount) <= 0
+                    ? 'Enter a positive withdrawal amount.'
+                    : recipientDelegationStatus === 'has-power'
+                    ? 'Recipient has on-chain voting power (GOV delegated).'
+                    : recipientDelegationStatus === 'record-only'
+                    ? 'Recipient has a delegation record but 0 on-chain votes. This is OK — recipients do not need to be delegated.'
+                    : 'Valid recipient address. Note: Recipients do not need to hold GOV tokens.'
+                }
               >
                 <span style={{ fontSize: '1.1rem' }}>{isCheckingRecipient ? '⏳' : recipientOk ? '✅' : (!isWithdrawalMode ? '➖' : '❌')}</span>
                 <span style={{ fontSize: '0.75rem', fontWeight: 600, opacity: 0.65, color: recipientOk ? 'var(--accent-primary)' : (!isWithdrawalMode ? 'inherit' : 'var(--danger)') }}>Recipient</span>
