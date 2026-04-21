@@ -344,7 +344,27 @@ app.post('/propose', async (req, res) => {
       console.warn(`[propose] on-chain votes check failed (non-fatal):`, chainErr.message);
     }
 
-    // ── Rule 3: Recipient validation — NO delegation required ────────────────
+    // ── Rule 3: Target Validation ───────────────────────────────────────────
+    // Treasury contract is ALWAYS valid.
+    // Any other contract MUST have a delegation record in MongoDB.
+    const addrs = getAddresses();
+    const treasuryAddr = addrs.treasuryAddress || process.env.TREASURY_ADDRESS;
+    const isTreasury = treasuryAddr && normalizedTarget.toLowerCase() === treasuryAddr.toLowerCase();
+
+    if (!isTreasury) {
+      const targetDelegation = await Delegation.findOne({
+        delegatorAddress: normalizedTarget.toLowerCase()
+      });
+      if (!targetDelegation) {
+        console.warn(`[propose] ❌ Target ${normalizedTarget} — not the Treasury and no MongoDB delegation record`);
+        return res.status(403).json({ error: 'Target address is not the Treasury and has no delegation record.' });
+      }
+      console.log(`[propose] ✅ Target ${normalizedTarget} — delegation verified`);
+    } else {
+      console.log(`[propose] ✅ Target ${normalizedTarget} — Treasury identified (exempt from delegation check)`);
+    }
+
+    // ── Rule 4: Recipient validation — NO delegation required ────────────────
     // Any valid Ethereum address may receive funds. Treasury, EOAs, and other
     // contracts are all accepted. We log for audit but never block on this.
     if (normalizedRecipient) {
@@ -355,13 +375,6 @@ app.post('/propose', async (req, res) => {
         `[propose] ℹ️  Recipient ${normalizedRecipient} — delegation record: ${!!recipientDelegation} (informational only, not blocking)`
       );
     }
-
-    const addrs = getAddresses();
-    const treasuryAddr = addrs.treasuryAddress || process.env.TREASURY_ADDRESS;
-    console.log(
-      `[propose] ✅ All checks passed — target: ${normalizedTarget}` +
-      (treasuryAddr && normalizedTarget.toLowerCase() === treasuryAddr.toLowerCase() ? ' [Treasury — exempt from delegation check]' : '')
-    );
 
     // Generate P-001 style short ID: count existing proposals + 1
     const count = await Proposal.countDocuments();
@@ -512,7 +525,7 @@ app.get('/proposals', async (req, res) => {
   try {
     const proposals = await Proposal.aggregate([
       { $lookup: { from: 'votes', localField: 'proposalId', foreignField: 'proposalId', as: 'votes' } },
-      { $project: { proposalId: 1, shortId: 1, proposerAddress: 1, description: 1, target: 1, value: 1, calldata: 1, timestamp: 1, status: 1, recipient: 1, amount: 1, votes: { choice: 1, zkProofVersion: 1 } } },
+      { $project: { proposalId: 1, shortId: 1, proposerAddress: 1, description: 1, target: 1, value: 1, calldata: 1, timestamp: 1, status: 1, recipient: 1, amount: 1, direction: 1, votes: { choice: 1, zkProofVersion: 1 } } },
       { $sort: { timestamp: -1 } }
     ]);
     const formatted = proposals.map(p => {
@@ -522,7 +535,16 @@ app.get('/proposals', async (req, res) => {
         if (tally[v.choice] !== undefined) tally[v.choice]++;
         if (v.zkProofVersion && v.zkProofVersion !== 'v0-legacy') securedVotes++;
       });
-      return { ...p, results: tally, status: p.status || 'ACTIVE', securedVotes };
+      // Infer direction for backward compatibility:
+      // Proposals created before `direction` was stored will have null/undefined.
+      // Rule: empty calldata ('0x') + value > 0 → deposit; otherwise → withdraw.
+      let direction = p.direction;
+      if (!direction) {
+        const hasCalldata = p.calldata && p.calldata !== '0x';
+        const hasValue = p.value && parseFloat(p.value) > 0;
+        direction = (!hasCalldata && hasValue) ? 'deposit' : 'withdraw';
+      }
+      return { ...p, direction, results: tally, status: p.status || 'ACTIVE', securedVotes };
     });
     return res.json(formatted);
   } catch (err) {
@@ -751,8 +773,17 @@ app.post('/execute/:proposalId', async (req, res) => {
     const result = await withSignerLock(async () => {
       const { provider, signer, governor } = await getGovernorSigner();
       const { description, target, value, calldata, recipient, direction } = dbProposal;
-      const descriptionHash = ethers.id(description);
       const isDeposit = direction === 'deposit';
+
+      if (isDeposit) {
+        console.warn(`[execute] 🛑 Deposit proposal ${proposalId} blocked from relayer execution. Manual execution required.`);
+        throw Object.assign(
+          new Error("Manual execution required for deposits. Please use the 'Execute' button in the dashboard to sign via MetaMask and send ETH from your wallet."),
+          { userError: true }
+        );
+      }
+
+      const descriptionHash = ethers.id(description);
       const log = [];
 
       // ── Normalize calldata ──────────────────────────────────────────────────
@@ -1013,6 +1044,90 @@ if (require.main === module) {
           });
       } else {
         console.warn('[on-chain] No governorAddress — event polling skipped. Deploy contracts first.');
+      }
+
+
+
+      // --- Treasury Deposit event poller ---
+      // Uses queryFilter polling (contract.on() crashes on Hardhat with ethers v6).
+      // On each Deposit(from, amount) event: log proof and mark proposal EXECUTED.
+      const liveTreasuryAddress = freshAddrs.treasuryAddress || TREASURY_ADDRESS;
+      if (liveTreasuryAddress) {
+        const TREASURY_EVENTS_ABI = [
+          'event Deposit(address indexed from, uint256 amount)',
+          'event Withdrawal(address indexed to, uint256 amount)'
+        ];
+        const treasuryProvider = new ethers.JsonRpcProvider(RPC_URL);
+        const treasuryContract  = new ethers.Contract(liveTreasuryAddress, TREASURY_EVENTS_ABI, treasuryProvider);
+        let lastDepositPollBlock = 0;
+
+        const pollForDeposits = async () => {
+          try {
+            const latest = await treasuryProvider.getBlockNumber();
+            if (latest <= lastDepositPollBlock) return;
+            const fromBlock = lastDepositPollBlock + 1;
+            const depositEvents = await treasuryContract.queryFilter('Deposit', fromBlock, latest);
+            if (Array.isArray(depositEvents)) {
+              for (const evt of depositEvents) {
+                try {
+                  const { from, amount } = evt.args;
+                  const amountEth = ethers.formatEther(amount);
+                  const blockNum  = evt.blockNumber;
+                  const [tBefore, tAfter, wBefore, wAfter] = await Promise.all([
+                    treasuryProvider.getBalance(liveTreasuryAddress, blockNum - 1),
+                    treasuryProvider.getBalance(liveTreasuryAddress, blockNum),
+                    treasuryProvider.getBalance(from, blockNum - 1),
+                    treasuryProvider.getBalance(from, blockNum)
+                  ]);
+                  const tNet = tAfter - tBefore;
+                  const wNet = wAfter  - wBefore;
+                  const sym  = tNet > 0n ? 'OK' : (tNet === 0n ? 'WARN' : 'ERR');
+                  console.log('[deposit] ============ ETH Transfer Proof ============');
+                  console.log('[deposit]   Direction: DEPOSIT (Wallet -> Treasury)');
+                  console.log(`[deposit]   From:      ${from}`);
+                  console.log(`[deposit]   Amount:    ${amountEth} ETH`);
+                  console.log(`[deposit]   Block:     ${blockNum}`);
+                  console.log(`[deposit]   Treasury:  ${ethers.formatEther(tBefore)} -> ${ethers.formatEther(tAfter)} ETH  (${tNet >= 0n ? '+' : ''}${ethers.formatEther(tNet)})  ${sym}`);
+                  console.log(`[deposit]   Wallet:    ${ethers.formatEther(wBefore)} -> ${ethers.formatEther(wAfter)} ETH  (${wNet >= 0n ? '+' : ''}${ethers.formatEther(wNet)})`);
+                  console.log('[deposit] ==============================================');
+                  const amountStr = parseFloat(amountEth).toString();
+                  const updated = await Proposal.findOneAndUpdate(
+                    {
+                      direction: 'deposit',
+                      target: { $regex: new RegExp('^' + liveTreasuryAddress + '$', 'i') },
+                      status: { $ne: 'EXECUTED' },
+                      $or: [{ amount: amountStr }, { amount: amountEth }, { value: amountStr }, { value: amount.toString() }]
+                    },
+                    { status: 'EXECUTED' },
+                    { sort: { timestamp: -1 }, new: true }
+                  ).catch(() => null);
+                  if (updated) {
+                    console.log(`[deposit] Marked ${updated.shortId} (${updated.proposalId.slice(0,10)}...) as EXECUTED`);
+                  } else {
+                    console.log(`[deposit] No pending proposal matched for ${amountEth} ETH from ${from}`);
+                  }
+                } catch (parseErr) {
+                  console.warn('[deposit] Event parse error:', parseErr.message);
+                }
+              }
+            }
+            lastDepositPollBlock = latest;
+          } catch (pollErr) {
+            if (!pollErr.message?.includes('ECONNREFUSED')) {
+              console.warn('[deposit] Poll error:', pollErr.message);
+            }
+          }
+        };
+
+        treasuryProvider.getBlockNumber()
+          .then(n => { lastDepositPollBlock = n; })
+          .catch(() => {})
+          .finally(() => {
+            setInterval(pollForDeposits, 2000);
+            console.log('[on-chain] Polling for Treasury Deposits on ' + liveTreasuryAddress);
+          });
+      } else {
+        console.warn('[on-chain] No treasuryAddress -- deposit event polling skipped.');
       }
 
       console.log(`[config] Serving Governor=${GOVERNOR_ADDRESS}, Treasury=${TREASURY_ADDRESS}`);

@@ -115,20 +115,34 @@ const Results = ({ provider, address }) => {
     const onChainState = proposalStates[proposal.proposalId];
     const totalVotes = calculateTotal(proposal.results);
     const isExecuted = proposal.status === 'EXECUTED';
+    const isDeposit = proposal.direction === 'deposit';
 
     if (isExecuted) return { label: 'Already Executed', disabled: true, variant: 'secondary' };
     if (totalVotes === 0) return { label: 'No Votes Yet', disabled: true, variant: 'primary' };
 
+    // Deposit proposals always require manual wallet execution — show a consistent label
+    // regardless of on-chain state so users know what to expect.
+    if (isDeposit) {
+      if (onChainState === 2) return { label: 'Proposal Canceled', disabled: true, variant: 'secondary' };
+      if (onChainState === 3) return { label: 'Proposal Defeated', disabled: true, variant: 'danger' };
+      if (onChainState === 6) return { label: 'Proposal Expired',  disabled: true, variant: 'danger' };
+      if (onChainState === 7) return { label: 'Proposal Executed', disabled: true, variant: 'success' };
+      if (onChainState === 0 || onChainState === 1) return { label: 'Voting in Progress…', disabled: true, variant: 'secondary' };
+      // States 4 (Succeeded), 5 (Queued), undefined (not yet fetched) — allow manual send
+      return { label: '💳 Send ETH to Treasury', disabled: false, variant: 'primary' };
+    }
+
+    // Non-deposit (withdrawal / standard) proposals use the automated relayer
     switch (onChainState) {
-      case 0: return { label: 'Activate Proposal',  disabled: false, variant: 'primary' }; // Pending
-      case 1: return { label: 'Push Tally to Chain', disabled: false, variant: 'primary' }; // Active
-      case 2: return { label: 'Proposal Canceled',   disabled: true,  variant: 'secondary' }; // Canceled
-      case 3: return { label: 'Proposal Defeated',   disabled: true,  variant: 'danger'    }; // Defeated
-      case 4: return { label: 'Queue & Execute',     disabled: false, variant: 'primary' }; // Succeeded
-      case 5: return { label: 'Execute Now',         disabled: false, variant: 'primary' }; // Queued
-      case 6: return { label: 'Proposal Expired',    disabled: true,  variant: 'danger'    }; // Expired
-      case 7: return { label: 'Proposal Executed',   disabled: true,  variant: 'success'   }; // Executed
-      case undefined: return { label: 'Check State...', disabled: false, variant: 'primary' };
+      case 0: return { label: 'Activate Proposal',   disabled: false, variant: 'primary' };
+      case 1: return { label: 'Push Tally to Chain',  disabled: false, variant: 'primary' };
+      case 2: return { label: 'Proposal Canceled',    disabled: true,  variant: 'secondary' };
+      case 3: return { label: 'Proposal Defeated',    disabled: true,  variant: 'danger' };
+      case 4: return { label: 'Queue & Execute',       disabled: false, variant: 'primary' };
+      case 5: return { label: 'Execute Now',           disabled: false, variant: 'primary' };
+      case 6: return { label: 'Proposal Expired',      disabled: true,  variant: 'danger' };
+      case 7: return { label: 'Proposal Executed',     disabled: true,  variant: 'success' };
+      case undefined: return { label: 'Check State…', disabled: false, variant: 'primary' };
       default: return { label: `State ${onChainState}: Run Action`, disabled: false, variant: 'primary' };
     }
   };
@@ -171,17 +185,105 @@ const Results = ({ provider, address }) => {
   };
 
   const handleFinalizeAction = async (proposal) => {
-    const { proposalId } = proposal;
+    const { proposalId, direction, description, target, value, calldata, amount } = proposal;
     const onChainState = proposalStates[proposalId];
     setIsSubmittingMap(prev => ({ ...prev, [proposalId]: true }));
     try {
+      // 1. DEPOSIT proposal — always route to manual MetaMask execution.
+      // Never call the backend relayer for deposits, regardless of on-chain state.
+      if (direction === 'deposit') {
+        if (!provider) throw new Error("Please connect your wallet to execute this deposit.");
+        
+        // Show instructional banner before MetaMask pops up
+        setSubmitStatuses(prev => ({
+          ...prev,
+          [proposalId]: { type: 'info', message: "⏳ Manual execution required — MetaMask will prompt you to send ETH from your wallet to the Treasury." }
+        }));
+
+        const signer = await provider.getSigner();
+        const userAddress = await signer.getAddress();
+
+        // Resolve the ETH amount to send:
+        // - `amount` is the human-readable ETH string stored at proposal creation (e.g. "2")
+        // - `value` is also stored as a human-readable ETH string (e.g. "2"), NOT wei
+        // Use `amount` first; fall back to `value`; throw if both are zero/missing.
+        let depositValueWei;
+        const amountNum = parseFloat(amount);
+        const valueNum = parseFloat(value);
+        if (amount && amountNum > 0) {
+          depositValueWei = ethers.parseEther(amount.toString());
+          console.log(`[manual] Using amount field: ${amount} ETH → ${depositValueWei} wei`);
+        } else if (value && valueNum > 0) {
+          // value field may be human-readable ETH or wei — detect by magnitude
+          // If value > 1e15 it's almost certainly wei (>=0.001 ETH stored as wei)
+          const valueBig = BigInt(Math.round(valueNum));
+          depositValueWei = valueBig > 1000000000000000n
+            ? valueBig
+            : ethers.parseEther(value.toString());
+          console.log(`[manual] Fallback to value field: "${value}" → ${ethers.formatEther(depositValueWei)} ETH`);
+        } else {
+          throw new Error(`Deposit amount is zero or missing. amount="${amount}", value="${value}". Cannot send 0 ETH.`);
+        }
+        const resolvedEth = ethers.formatEther(depositValueWei);
+
+        // --- PRE-BALANCE SNAPSHOT ---
+        const userBalBefore = await provider.getBalance(userAddress);
+        const treasuryBalBefore = await provider.getBalance(target);
+
+        // Direct ETH transfer: proposer → Treasury
+        // This correctly identifies the proposer as the source in the Deposit event.
+        console.log(`[manual] Sending ${ethers.formatEther(depositValueWei)} ETH directly to Treasury (${target})...`);
+        const tx = await signer.sendTransaction({
+          to: target,
+          value: depositValueWei
+        });
+        const receipt = await tx.wait();
+        console.log("[manual] Transfer confirmed! Tx:", tx.hash);
+
+        // --- POST-BALANCE SNAPSHOT ---
+        const userBalAfter = await provider.getBalance(userAddress);
+        const treasuryBalAfter = await provider.getBalance(target);
+        
+        const userDiff = userBalAfter - userBalBefore;
+        const treasuryDiff = treasuryBalAfter - treasuryBalBefore;
+
+        const proof = {
+          recipient: target,
+          label: 'Treasury (Deposit)',
+          direction: 'deposit',
+          txHash: tx.hash,
+          balanceBefore: ethers.formatEther(treasuryBalBefore),
+          balanceAfter: ethers.formatEther(treasuryBalAfter),
+          netChange: ethers.formatEther(treasuryDiff < 0n ? -treasuryDiff : treasuryDiff),
+          netSign: treasuryDiff >= 0n ? '+' : '-',
+          walletImpact: ethers.formatEther(userDiff < 0n ? -userDiff : userDiff),
+          walletSign: userDiff >= 0n ? '+' : '-'
+        };
+
+        // Notify backend to mark proposal EXECUTED in DB
+        await fetch(`http://localhost:5000/proposals/${proposalId}/status`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'EXECUTED' })
+        }).catch(() => {}); // Non-fatal if backend is unreachable
+        
+        setSubmitStatuses(prev => ({
+          ...prev,
+          [proposalId]: {
+            type: 'success',
+            message: `✅ Deposit confirmed! Sent ${amount} ETH from your wallet to the Treasury.`,
+            proof
+          }
+        }));
+        await fetchProposals();
+        return;
+      }
+
+      // 2. Default: Call Backend Relayer
       let endpoint;
-      
       if (onChainState === 1 || onChainState === 0) {
-        // Pending or Active → push tally on-chain
         endpoint = config.SUBMIT_ENDPOINT(proposalId);
       } else if (onChainState === 4 || onChainState === 5 || onChainState === undefined) {
-        // Succeeded, Queued, or unknown → run full finalization
         endpoint = config.EXECUTE_ENDPOINT(proposalId);
       } else {
         throw new Error(`Cannot act on proposal in state ${onChainState} (${stateLabel(onChainState)}).`);
@@ -191,14 +293,10 @@ const Results = ({ provider, address }) => {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || data.details || 'Action failed');
       
-      // Build status message from log array or message field
       const logLines = Array.isArray(data.log) ? data.log : [];
       const successMsg = data.proof
         ? `✅ Executed! ${data.proof.recipient?.slice(0,10)}… ${data.proof.balanceBefore} → ${data.proof.balanceAfter} ETH (${data.proof.netSign ?? '+'}${data.proof.netChange} ETH)`
         : logLines[logLines.length - 1] || 'Action completed.';
-
-      console.log('[lifecycle] Log:', logLines);
-      if (data.proof) console.log('[lifecycle] ETH Transfer Proof:', data.proof);
 
       setSubmitStatuses(prev => ({
         ...prev,
@@ -496,6 +594,12 @@ const Results = ({ provider, address }) => {
                             <tr><td style={{ color: 'var(--text-muted)' }}>Before</td><td style={{ color: 'var(--text-main)' }}>{submitStatus.proof.balanceBefore} ETH</td></tr>
                             <tr><td style={{ color: 'var(--text-muted)' }}>After</td><td style={{ color: 'var(--accent-primary)', fontWeight: 600 }}>{submitStatus.proof.balanceAfter} ETH</td></tr>
                             <tr><td style={{ color: 'var(--text-muted)' }}>Net Change</td><td style={{ color: 'var(--success)', fontWeight: 700 }}>{submitStatus.proof.netSign ?? '+'}{submitStatus.proof.netChange} ETH</td></tr>
+                            {submitStatus.proof.walletImpact && (
+                              <tr>
+                                <td style={{ color: 'var(--text-muted)' }}>Wallet Impact</td>
+                                <td style={{ color: 'var(--danger)', fontWeight: 600 }}>{submitStatus.proof.walletSign}{submitStatus.proof.walletImpact} ETH (incl. gas)</td>
+                              </tr>
+                            )}
                           </tbody>
                         </table>
                       </div>

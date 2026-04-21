@@ -109,6 +109,15 @@ const CreateProposal = ({ provider, address }) => {
 
   // 1. Check Target Delegation (to determine if Withdrawal Mode should be ON)
   useEffect(() => {
+    // If it's a deposit, target is ALWAYS the treasury
+    if (txDirection === 'deposit') {
+      if (contractConfig.treasuryAddress && targetAddress !== contractConfig.treasuryAddress) {
+        setTargetAddress(contractConfig.treasuryAddress);
+      }
+      setTargetDelegationStatus(null);
+      return;
+    }
+
     const checkTargetDelegation = async () => {
       const trimmed = targetAddress.trim();
       if (!trimmed || !ethers.isAddress(trimmed) || trimmed.toLowerCase() === contractConfig.treasuryAddress?.toLowerCase()) {
@@ -434,7 +443,13 @@ const CreateProposal = ({ provider, address }) => {
               value={targetAddress}
               onChange={(e) => setTargetAddress(e.target.value)}
               required
-              style={isWithdrawalMode ? { borderColor: 'var(--accent-primary)', boxShadow: '0 0 10px rgba(0, 255, 136, 0.2)', padding: '12px' } : { padding: '12px' }}
+              disabled={txDirection === 'deposit'}
+              style={{
+                ...(isWithdrawalMode ? { borderColor: 'var(--accent-primary)', boxShadow: '0 0 10px rgba(0, 255, 136, 0.2)' } : {}),
+                padding: '12px',
+                opacity: txDirection === 'deposit' ? 0.7 : 1,
+                cursor: txDirection === 'deposit' ? 'not-allowed' : 'text'
+              }}
             />
           {isWithdrawalMode && (
             <div className="mt-2 text-xs flex items-center gap-1" style={{ color: 'var(--accent-primary)', fontWeight: 600, marginTop: '8px' }}>
