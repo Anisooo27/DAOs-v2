@@ -245,7 +245,7 @@ async function autoAdvanceToSucceeded(proposalId) {
       console.log(`[auto-tally] After period mine: ${state} (${stateLabel(state)})`);
 
       if (state === 4) {
-        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }).catch(() => {});
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }, { returnDocument: 'after' }).catch(() => {});
         console.log(`[auto-tally] ✅ ${proposalId.slice(0,10)}... SUCCEEDED.`);
       } else {
         console.warn(`[auto-tally] ⚠️ Expected Succeeded (4), got ${state}.`);
@@ -376,9 +376,13 @@ app.post('/propose', async (req, res) => {
       );
     }
 
-    // Generate P-001 style short ID: count existing proposals + 1
-    const count = await Proposal.countDocuments();
-    const shortId = `P-${String(count + 1).padStart(3, '0')}`;
+    // ── ShortId generation ────────────────────────────────────────────────────
+    // Use timestamp + proposalId prefix instead of COUNT(*)+1.
+    // COUNT-based IDs (P-001, P-002…) are NOT safe under concurrent inserts:
+    // two simultaneous requests can read the same count and produce the same
+    // shortId, causing an E11000 unique-index violation.
+    // Timestamp-based IDs are monotonically increasing and collision-resistant.
+    let shortId = `P-${Date.now()}-${proposalId.slice(0, 6)}`;
 
     // Normalize calldata to 0x-prefix — Governor encodedCalldata always starts with 0x.
     // Storing without it would cause keccak256(targets,values,calldatas,descHash) ≠ proposalId
@@ -386,7 +390,7 @@ app.post('/propose', async (req, res) => {
       ? '0x' + calldata
       : (calldata || '0x');
 
-    const newProposal = new Proposal({
+    const proposalDoc = {
       proposalId,
       shortId,
       proposerAddress: proposerAddress.toLowerCase(),
@@ -398,16 +402,45 @@ app.post('/propose', async (req, res) => {
       amount,
       signature,
       direction: direction || 'withdraw',
-    });
-    await newProposal.save();
-    console.log(`[propose] Saved proposal ${shortId} (${proposalId.slice(0,10)}...). Triggering auto-tally.`);
+    };
 
+    // ── Save with one-shot shortId retry ─────────────────────────────────────
+    // In the unlikely event of a shortId collision (same millisecond + same
+    // proposalId prefix), regenerate and retry exactly once before giving up.
+    try {
+      await new Proposal(proposalDoc).save();
+      console.log(`[propose] ✅ DB insert OK — shortId=${shortId} proposalId=${proposalId.slice(0,10)}...`);
+    } catch (saveErr) {
+      // shortId unique-key collision → regenerate and retry once
+      if (saveErr.code === 11000 && saveErr.message?.includes('shortId')) {
+        console.warn(`[propose] ⚠️ shortId collision on ${shortId} — regenerating and retrying...`);
+        shortId = `P-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+        proposalDoc.shortId = shortId;
+        try {
+          await new Proposal(proposalDoc).save();
+          console.log(`[propose] ✅ DB insert OK (retry) — shortId=${shortId} proposalId=${proposalId.slice(0,10)}...`);
+        } catch (retryErr) {
+          console.error(`[propose] ❌ DB insert FAILED after retry — proposalId=${proposalId}`, retryErr);
+          // proposalId duplicate = the on-chain proposal already has a DB record
+          if (retryErr.code === 11000) return res.status(409).json({ error: 'Proposal already exists in DB' });
+          return res.status(500).json({ error: retryErr.message });
+        }
+      } else if (saveErr.code === 11000) {
+        // proposalId is the duplicate key → true duplicate, return 409
+        console.warn(`[propose] ⚠️ Duplicate proposalId — already in DB: ${proposalId.slice(0,10)}...`);
+        return res.status(409).json({ error: 'Proposal already exists in DB' });
+      } else {
+        console.error(`[propose] ❌ DB insert FAILED — proposalId=${proposalId}`, saveErr);
+        return res.status(500).json({ error: saveErr.message });
+      }
+    }
+
+    console.log(`[propose] Triggering auto-tally for ${shortId}.`);
     setImmediate(() => autoAdvanceToSucceeded(proposalId));
 
     return res.status(201).json({ success: true, proposalId, shortId, autoTally: true });
   } catch (error) {
-    if (error.code === 11000) return res.status(409).json({ error: 'Proposal exists' });
-    console.error('Error creating proposal:', error);
+    console.error('[propose] Unexpected error:', error);
     return res.status(500).json({ error: error.message });
   }
 });
@@ -557,7 +590,7 @@ app.patch('/proposals/:proposalId/status', async (req, res) => {
   try {
     const { proposalId } = req.params;
     const { status } = req.body;
-    const proposal = await Proposal.findOneAndUpdate({ proposalId }, { status }, { new: true });
+    const proposal = await Proposal.findOneAndUpdate({ proposalId }, { status }, { returnDocument: 'after' });
     if (!proposal) return res.status(404).json({ error: 'Not found' });
     console.log(`[db] ${proposalId} -> ${status}`);
     res.json({ success: true, proposal });
@@ -717,7 +750,7 @@ app.post('/submit/:proposalId', async (req, res) => {
       if (state === 4) {
         log.push('Proposal already Succeeded — tally was pushed automatically.');
         console.log('[pushTally] Already Succeeded — short-circuit.');
-        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }).catch(() => {});
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }, { returnDocument: 'after' }).catch(() => {});
         return { state, stateLabel: stateLabel(state), log, alreadySucceeded: true };
       }
 
@@ -744,7 +777,7 @@ app.post('/submit/:proposalId', async (req, res) => {
       console.log(`[pushTally] ${log[log.length - 1]}`);
 
       if (state === 4) {
-        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }).catch(() => {});
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }, { returnDocument: 'after' }).catch(() => {});
         log.push('✅ Proposal Succeeded!');
       } else {
         log.push(`⚠️ Expected Succeeded (4), got ${state}.`);
@@ -926,7 +959,12 @@ app.post('/execute/:proposalId', async (req, res) => {
       log.push(`✅ Executed! Tx: ${exTx.hash} | Block: ${receipt.blockNumber}`);
       console.log(`[execute] ${log[log.length - 1]}`);
 
-      await Proposal.findOneAndUpdate({ proposalId }, { status: 'EXECUTED' }).catch(() => {});
+      const execUpdated = await Proposal.findOneAndUpdate({ proposalId }, { status: 'EXECUTED' }, { returnDocument: 'after' }).catch(() => null);
+      if (execUpdated) {
+        console.log(`[execute] ✅ DB updated — ${execUpdated.shortId || proposalId.slice(0,10)} → EXECUTED`);
+      } else {
+        console.warn(`[execute] ⚠️ DB update skipped — no record found for proposalId=${proposalId.slice(0,10)}...`);
+      }
 
       // Snapshot balance AFTER — pinned to the exact execute block.
       let proof = null;
@@ -1010,15 +1048,65 @@ if (require.main === module) {
                 for (const evt of events) {
                   try {
                     const [proposalId, proposer, targets, values, , , , , description] = evt.args;
+                    const proposalIdStr = proposalId.toString();
                     let valueDisplay = '0';
-                    try { valueDisplay = Array.isArray(values) && values.length > 0 ? ethers.formatEther(values[0]) : '0'; } catch {}
+                    let valueRaw = '0';
+                    try {
+                      if (Array.isArray(values) && values.length > 0) {
+                        valueDisplay = ethers.formatEther(values[0]);
+                        valueRaw = values[0].toString();
+                      }
+                    } catch {}
+                    const targetAddr = Array.isArray(targets) ? targets[0] : '';
                     console.log(`\n--- [on-chain] ProposalCreated ---`);
-                    console.log(`ID:       ${proposalId.toString()}`);
+                    console.log(`ID:       ${proposalIdStr}`);
                     console.log(`Proposer: ${proposer}`);
-                    console.log(`Target:   ${Array.isArray(targets) ? targets[0] : 'n/a'}`);
+                    console.log(`Target:   ${targetAddr}`);
                     console.log(`Value:    ${valueDisplay} ETH`);
                     console.log(`Desc:     ${description}`);
                     console.log(`----------------------------------\n`);
+
+                    // ── Safety-net DB upsert ──────────────────────────────────
+                    // If POST /propose was missed (network error, MetaMask cancel
+                    // after the on-chain tx landed), upsert a skeleton record so
+                    // the proposal is still visible in the dashboard.
+                    //
+                    // Uses $setOnInsert so it is a true no-op when the record
+                    // already exists (POST /propose already wrote the full record).
+                    // Uses updateOne+upsert instead of create() to avoid the
+                    // count-based shortId race that caused E11000 collisions.
+                    //
+                    // Direction heuristic: value > 0 and calldata is '0x' → deposit
+                    const evtDirection = (valueRaw !== '0' && valueRaw !== '') ? 'deposit' : 'withdraw';
+                    const evtShortId   = `P-EVT-${Date.now()}-${proposalIdStr.slice(0, 6)}`;
+                    try {
+                      const upsertResult = await Proposal.updateOne(
+                        { proposalId: proposalIdStr },
+                        {
+                          $setOnInsert: {
+                            proposalId:      proposalIdStr,
+                            shortId:         evtShortId,
+                            proposerAddress: proposer.toLowerCase(),
+                            description,
+                            target:          targetAddr,
+                            value:           valueRaw,
+                            calldata:        '0x',
+                            signature:       'recovered-from-chain-event',
+                            direction:       evtDirection,
+                            status:          'ACTIVE',
+                          }
+                        },
+                        { upsert: true }
+                      );
+                      if (upsertResult.upsertedCount > 0) {
+                        console.log(`[on-chain] ✅ Safety-net insert: proposalId=${proposalIdStr.slice(0,10)}... direction=${evtDirection} (skeleton)`);
+                      } else {
+                        console.log(`[on-chain] ℹ️  proposalId=${proposalIdStr.slice(0,10)}... already in DB — upsert was a no-op.`);
+                      }
+                    } catch (upsertErr) {
+                      console.warn(`[on-chain] ⚠️ Safety-net upsert failed:`, upsertErr.message);
+                    }
+                    // ─────────────────────────────────────────────────────────
                   } catch (parseErr) {
                     console.warn('[on-chain] Event parse error:', parseErr.message);
                   }
@@ -1099,12 +1187,12 @@ if (require.main === module) {
                       $or: [{ amount: amountStr }, { amount: amountEth }, { value: amountStr }, { value: amount.toString() }]
                     },
                     { status: 'EXECUTED' },
-                    { sort: { timestamp: -1 }, new: true }
+                    { sort: { timestamp: -1 }, returnDocument: 'after' }
                   ).catch(() => null);
                   if (updated) {
-                    console.log(`[deposit] Marked ${updated.shortId} (${updated.proposalId.slice(0,10)}...) as EXECUTED`);
+                    console.log(`[deposit] ✅ Marked ${updated.shortId} (${updated.proposalId.slice(0,10)}...) as EXECUTED`);
                   } else {
-                    console.log(`[deposit] No pending proposal matched for ${amountEth} ETH from ${from}`);
+                    console.log(`[deposit] ⚠️ No pending deposit proposal matched for ${amountEth} ETH from ${from}`);
                   }
                 } catch (parseErr) {
                   console.warn('[deposit] Event parse error:', parseErr.message);

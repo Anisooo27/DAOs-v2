@@ -269,7 +269,35 @@ const CreateProposal = ({ provider, address }) => {
       
       const signature = await signer.signMessage(message);
 
-      // --- NEW: Trigger On-Chain Propose ---
+      // ── Pre-flight duplicate detection ──────────────────────────────────────
+      // Check DB for any open proposal with the same description BEFORE sending
+      // the on-chain tx. This avoids a wasted MetaMask popup + gas spend.
+      // Rule: block only when DB has ACTIVE / SUCCEEDED / QUEUED match.
+      //       EXECUTED proposals are closed — re-proposing is allowed.
+      try {
+        const dbProposals = await fetch('http://localhost:5000/proposals').then(r => r.json()).catch(() => []);
+        if (Array.isArray(dbProposals)) {
+          const duplicate = dbProposals.find(p =>
+            p.description.trim() === description.trim() &&
+            ['ACTIVE', 'SUCCEEDED', 'QUEUED'].includes(p.status)
+          );
+          if (duplicate) {
+            throw new Error(
+              `A proposal with this description already exists ` +
+              `(${duplicate.shortId || duplicate.proposalId?.slice(0, 10) + '…'}) ` +
+              `and is still ${duplicate.status}. ` +
+              `Wait for it to be executed or defeated before re-proposing.`
+            );
+          }
+        }
+      } catch (dupErr) {
+        // Re-throw only if it's OUR duplicate error; ignore fetch/parse failures
+        if (dupErr.message.startsWith('A proposal with this description')) throw dupErr;
+        console.warn('[propose] Duplicate pre-check skipped (fetch error):', dupErr.message);
+      }
+      // ────────────────────────────────────────────────────────────────────────
+
+      // --- Trigger On-Chain Propose ---
       console.log("Registering proposal on-chain via Governor:", contractConfig.governorAddress);
       
       const GOVERNOR_ABI = [
