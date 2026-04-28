@@ -50,7 +50,8 @@ const proposalSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['ACTIVE', 'SUCCEEDED', 'QUEUED', 'EXECUTED'],
+    // DEFEATED added: majority voted Against, or quorum not met
+    enum: ['ACTIVE', 'SUCCEEDED', 'QUEUED', 'EXECUTED', 'DEFEATED'],
     default: 'ACTIVE',
   },
   // 'withdraw' = Treasury → Wallet (withdrawETH calldata, value=0)
@@ -60,6 +61,21 @@ const proposalSchema = new mongoose.Schema({
     type: String,
     enum: ['withdraw', 'deposit', 'custom'],
     default: 'withdraw',
+  },
+  // Attached by the deposit event poller when a Deposit(from, amount) event
+  // is seen on-chain. Stored even if the proposal was already EXECUTED so the
+  // poller can reconcile without emitting false "no match" warnings.
+  executionEvent: {
+    type: {
+      txHash:    { type: String },
+      blockNumber: { type: Number },
+      from:      { type: String },
+      to:        { type: String },
+      amountEth: { type: String },
+      timestamp: { type: Date, default: Date.now }
+    },
+    required: false,
+    default: undefined,
   }
 });
 

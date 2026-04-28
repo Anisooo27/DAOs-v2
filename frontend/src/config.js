@@ -10,7 +10,8 @@ export default {
   VOTE_ENDPOINT: `${BACKEND_URL}/vote`,
   RESULTS_ENDPOINT: (proposalId) => `${BACKEND_URL}/results/${proposalId}`,
   PROPOSALS_ENDPOINT: `${BACKEND_URL}/proposals`,
-  SUBMIT_ENDPOINT: (proposalId) => `${BACKEND_URL}/submit/${proposalId}`,
+  SUBMIT_ENDPOINT:  (proposalId) => `${BACKEND_URL}/submit/${proposalId}`,
+  QUEUE_ENDPOINT:   (proposalId) => `${BACKEND_URL}/execute/${proposalId}`,
   EXECUTE_ENDPOINT: (proposalId) => `${BACKEND_URL}/execute/${proposalId}`,
   CONFIG_ENDPOINT: `${BACKEND_URL}/config/contract`,
 };

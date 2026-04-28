@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { CheckCircle, XCircle, MinusCircle, Search, Activity, RefreshCw, ShieldCheck, ExternalLink, Info } from 'lucide-react';
+import { CheckCircle, XCircle, MinusCircle, Search, Activity, RefreshCw, ShieldCheck, ExternalLink, Info, AlertTriangle } from 'lucide-react';
 import { ethers } from 'ethers';
 import config from '../config';
 
@@ -16,6 +16,8 @@ const Results = ({ provider, address }) => {
   // Track submission status per proposalId
   const [submitStatuses, setSubmitStatuses] = useState({});
   const [isSubmittingMap, setIsSubmittingMap] = useState({});
+  // Tracks which step is currently submitting: 'tally' | 'execute' | null
+  const [stepSubmitting, setStepSubmitting] = useState({});
 
   const OPTIONS = [
     { id: '1', label: 'For', icon: CheckCircle, color: 'var(--success)' },
@@ -111,41 +113,9 @@ const Results = ({ provider, address }) => {
     }
   };
 
-  const getButtonProps = (proposal) => {
-    const onChainState = proposalStates[proposal.proposalId];
-    const totalVotes = calculateTotal(proposal.results);
-    const isExecuted = proposal.status === 'EXECUTED';
-    const isDeposit = proposal.direction === 'deposit';
-
-    if (isExecuted) return { label: 'Already Executed', disabled: true, variant: 'secondary' };
-    if (totalVotes === 0) return { label: 'No Votes Yet', disabled: true, variant: 'primary' };
-
-    // Deposit proposals always require manual wallet execution — show a consistent label
-    // regardless of on-chain state so users know what to expect.
-    if (isDeposit) {
-      if (onChainState === 2) return { label: 'Proposal Canceled', disabled: true, variant: 'secondary' };
-      if (onChainState === 3) return { label: 'Proposal Defeated', disabled: true, variant: 'danger' };
-      if (onChainState === 6) return { label: 'Proposal Expired',  disabled: true, variant: 'danger' };
-      if (onChainState === 7) return { label: 'Proposal Executed', disabled: true, variant: 'success' };
-      if (onChainState === 0 || onChainState === 1) return { label: 'Voting in Progress…', disabled: true, variant: 'secondary' };
-      // States 4 (Succeeded), 5 (Queued), undefined (not yet fetched) — allow manual send
-      return { label: '💳 Send ETH to Treasury', disabled: false, variant: 'primary' };
-    }
-
-    // Non-deposit (withdrawal / standard) proposals use the automated relayer
-    switch (onChainState) {
-      case 0: return { label: 'Activate Proposal',   disabled: false, variant: 'primary' };
-      case 1: return { label: 'Push Tally to Chain',  disabled: false, variant: 'primary' };
-      case 2: return { label: 'Proposal Canceled',    disabled: true,  variant: 'secondary' };
-      case 3: return { label: 'Proposal Defeated',    disabled: true,  variant: 'danger' };
-      case 4: return { label: 'Queue & Execute',       disabled: false, variant: 'primary' };
-      case 5: return { label: 'Execute Now',           disabled: false, variant: 'primary' };
-      case 6: return { label: 'Proposal Expired',      disabled: true,  variant: 'danger' };
-      case 7: return { label: 'Proposal Executed',     disabled: true,  variant: 'success' };
-      case undefined: return { label: 'Check State…', disabled: false, variant: 'primary' };
-      default: return { label: `State ${onChainState}: Run Action`, disabled: false, variant: 'primary' };
-    }
-  };
+  // ── helper: status setter shorthand ───────────────────────────────────────
+  const setStatus = (proposalId, patch) =>
+    setSubmitStatuses(prev => ({ ...prev, [proposalId]: patch ? { ...prev[proposalId], ...patch } : null }));
 
   useEffect(() => {
     fetchProposals();
@@ -166,153 +136,128 @@ const Results = ({ provider, address }) => {
     (p.shortId && p.shortId.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
-  const handleSubmitTally = async (proposalId) => {
-    setIsSubmittingMap(prev => ({ ...prev, [proposalId]: true }));
+  // ── Step 1: Push Tally ─────────────────────────────────────────────────────
+  // Calls POST /submit → mines past voting period → SUCCEEDED or DEFEATED
+  const handlePushTally = async (proposal) => {
+    const { proposalId } = proposal;
+    setStepSubmitting(prev => ({ ...prev, [proposalId]: 'tally' }));
+    setStatus(proposalId, null);
     try {
-      const response = await fetch(config.SUBMIT_ENDPOINT(proposalId), {
-        method: 'POST'
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to submit tally script');
-      alert(`Tally Script Triggered! Success.`);
-      await fetchProposals(); 
+      const res  = await fetch(config.SUBMIT_ENDPOINT(proposalId), { method: 'POST' });
+      const data = await res.json();
+      if (data.defeated || data.state === 3) {
+        setStatus(proposalId, {
+          type: 'defeated',
+          message: '❌ Proposal Defeated — majority voted Against or quorum not met. Execution permanently blocked.'
+        });
+      } else if (!res.ok) {
+        throw new Error(data.error || 'Push Tally failed');
+      } else {
+        const logLines = Array.isArray(data.log) ? data.log : [];
+        setStatus(proposalId, {
+          type: 'success',
+          message: logLines[logLines.length - 1] || '✅ Tally pushed — proposal Succeeded!'
+        });
+      }
     } catch (err) {
-      console.error("Error triggering tally:", err);
-      alert(err.message);
+      console.error('[pushTally]', err);
+      const isVotingActive = err.message?.includes('Voting period still active');
+      setStatus(proposalId, { type: 'error', message: err.message, isVotingActive });
     } finally {
-      setIsSubmittingMap(prev => ({ ...prev, [proposalId]: false }));
+      setStepSubmitting(prev => ({ ...prev, [proposalId]: null }));
+      await fetchProposals();
     }
   };
 
-  const handleFinalizeAction = async (proposal) => {
-    const { proposalId, direction, description, target, value, calldata, amount } = proposal;
-    const onChainState = proposalStates[proposalId];
-    setIsSubmittingMap(prev => ({ ...prev, [proposalId]: true }));
+  // ── Step 2/3: Execute (handles both Queue→Execute and Execute-only) ─────────
+  // For deposit proposals: triggers MetaMask send directly.
+  // For standard proposals: calls POST /execute → queue → timelock → execute.
+  const handleExecute = async (proposal) => {
+    const { proposalId, direction, target, value, amount } = proposal;
+    setStepSubmitting(prev => ({ ...prev, [proposalId]: 'execute' }));
+    setStatus(proposalId, null);
     try {
-      // 1. DEPOSIT proposal — always route to manual MetaMask execution.
-      // Never call the backend relayer for deposits, regardless of on-chain state.
+      // ── Deposit: manual MetaMask send ──────────────────────────────────────
       if (direction === 'deposit') {
-        if (!provider) throw new Error("Please connect your wallet to execute this deposit.");
-        
-        // Show instructional banner before MetaMask pops up
-        setSubmitStatuses(prev => ({
-          ...prev,
-          [proposalId]: { type: 'info', message: "⏳ Manual execution required — MetaMask will prompt you to send ETH from your wallet to the Treasury." }
-        }));
-
+        if (!provider) throw new Error('Please connect your wallet to execute this deposit.');
+        setStatus(proposalId, { type: 'info', message: '⏳ MetaMask will prompt you to send ETH from your wallet to the Treasury.' });
         const signer = await provider.getSigner();
         const userAddress = await signer.getAddress();
-
-        // Resolve the ETH amount to send:
-        // - `amount` is the human-readable ETH string stored at proposal creation (e.g. "2")
-        // - `value` is also stored as a human-readable ETH string (e.g. "2"), NOT wei
-        // Use `amount` first; fall back to `value`; throw if both are zero/missing.
         let depositValueWei;
         const amountNum = parseFloat(amount);
-        const valueNum = parseFloat(value);
+        const valueNum  = parseFloat(value);
         if (amount && amountNum > 0) {
           depositValueWei = ethers.parseEther(amount.toString());
-          console.log(`[manual] Using amount field: ${amount} ETH → ${depositValueWei} wei`);
         } else if (value && valueNum > 0) {
-          // value field may be human-readable ETH or wei — detect by magnitude
-          // If value > 1e15 it's almost certainly wei (>=0.001 ETH stored as wei)
           const valueBig = BigInt(Math.round(valueNum));
-          depositValueWei = valueBig > 1000000000000000n
-            ? valueBig
-            : ethers.parseEther(value.toString());
-          console.log(`[manual] Fallback to value field: "${value}" → ${ethers.formatEther(depositValueWei)} ETH`);
+          depositValueWei = valueBig > 1000000000000000n ? valueBig : ethers.parseEther(value.toString());
         } else {
-          throw new Error(`Deposit amount is zero or missing. amount="${amount}", value="${value}". Cannot send 0 ETH.`);
+          throw new Error(`Deposit amount is zero or missing. amount="${amount}", value="${value}".`);
         }
-        const resolvedEth = ethers.formatEther(depositValueWei);
-
-        // --- PRE-BALANCE SNAPSHOT ---
-        const userBalBefore = await provider.getBalance(userAddress);
+        const userBalBefore     = await provider.getBalance(userAddress);
         const treasuryBalBefore = await provider.getBalance(target);
-
-        // Direct ETH transfer: proposer → Treasury
-        // This correctly identifies the proposer as the source in the Deposit event.
-        console.log(`[manual] Sending ${ethers.formatEther(depositValueWei)} ETH directly to Treasury (${target})...`);
-        const tx = await signer.sendTransaction({
-          to: target,
-          value: depositValueWei
-        });
-        const receipt = await tx.wait();
-        console.log("[manual] Transfer confirmed! Tx:", tx.hash);
-
-        // --- POST-BALANCE SNAPSHOT ---
-        const userBalAfter = await provider.getBalance(userAddress);
+        const tx = await signer.sendTransaction({ to: target, value: depositValueWei });
+        await tx.wait();
+        const userBalAfter     = await provider.getBalance(userAddress);
         const treasuryBalAfter = await provider.getBalance(target);
-        
-        const userDiff = userBalAfter - userBalBefore;
-        const treasuryDiff = treasuryBalAfter - treasuryBalBefore;
-
+        const tDiff = treasuryBalAfter - treasuryBalBefore;
+        const wDiff = userBalAfter - userBalBefore;
         const proof = {
-          recipient: target,
-          label: 'Treasury (Deposit)',
-          direction: 'deposit',
-          txHash: tx.hash,
+          recipient:     target, label: 'Treasury (Deposit)', direction: 'deposit',
+          txHash:        tx.hash,
           balanceBefore: ethers.formatEther(treasuryBalBefore),
-          balanceAfter: ethers.formatEther(treasuryBalAfter),
-          netChange: ethers.formatEther(treasuryDiff < 0n ? -treasuryDiff : treasuryDiff),
-          netSign: treasuryDiff >= 0n ? '+' : '-',
-          walletImpact: ethers.formatEther(userDiff < 0n ? -userDiff : userDiff),
-          walletSign: userDiff >= 0n ? '+' : '-'
+          balanceAfter:  ethers.formatEther(treasuryBalAfter),
+          netChange:     ethers.formatEther(tDiff < 0n ? -tDiff : tDiff),
+          netSign:       tDiff >= 0n ? '+' : '-',
+          walletImpact:  ethers.formatEther(wDiff < 0n ? -wDiff : wDiff),
+          walletSign:    wDiff >= 0n ? '+' : '-'
         };
-
-        // Notify backend to mark proposal EXECUTED in DB
         await fetch(`http://localhost:5000/proposals/${proposalId}/status`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: 'EXECUTED' })
-        }).catch(() => {}); // Non-fatal if backend is unreachable
-        
-        setSubmitStatuses(prev => ({
-          ...prev,
-          [proposalId]: {
-            type: 'success',
-            message: `✅ Deposit confirmed! Sent ${amount} ETH from your wallet to the Treasury.`,
-            proof
-          }
-        }));
+        }).catch(() => {});
+        setStatus(proposalId, {
+          type: 'success',
+          message: `✅ Deposit confirmed! Sent ${amount || ethers.formatEther(depositValueWei)} ETH to the Treasury.`,
+          proof
+        });
         await fetchProposals();
         return;
       }
 
-      // 2. Default: Call Backend Relayer
-      let endpoint;
-      if (onChainState === 1 || onChainState === 0) {
-        endpoint = config.SUBMIT_ENDPOINT(proposalId);
-      } else if (onChainState === 4 || onChainState === 5 || onChainState === undefined) {
-        endpoint = config.EXECUTE_ENDPOINT(proposalId);
+      // ── Standard: backend relayer (queue → timelock → execute) ────────────
+      const res  = await fetch(config.EXECUTE_ENDPOINT(proposalId), { method: 'POST' });
+      const data = await res.json();
+      if (data.defeated || data.state === 3) {
+        setStatus(proposalId, {
+          type: 'defeated',
+          message: '❌ Proposal Defeated — majority voted Against or quorum not met. Execution blocked.'
+        });
+      } else if (data.votingActive || data.state === 1) {
+        setStatus(proposalId, {
+          type: 'error', isVotingActive: true,
+          message: data.error || 'Voting period still active — push tally first.'
+        });
+      } else if (!res.ok) {
+        throw new Error(data.error || data.details || 'Execute failed');
       } else {
-        throw new Error(`Cannot act on proposal in state ${onChainState} (${stateLabel(onChainState)}).`);
+        const logLines = Array.isArray(data.log) ? data.log : [];
+        const successMsg = data.proof
+          ? `✅ Executed! ${data.proof.recipient?.slice(0,10)}… ${data.proof.balanceBefore} → ${data.proof.balanceAfter} ETH (${data.proof.netSign ?? '+'}${data.proof.netChange} ETH)`
+          : logLines[logLines.length - 1] || '✅ Executed!';
+        setStatus(proposalId, { type: 'success', message: successMsg, proof: data.proof, log: logLines });
       }
-
-      const response = await fetch(endpoint, { method: 'POST' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || data.details || 'Action failed');
-      
-      const logLines = Array.isArray(data.log) ? data.log : [];
-      const successMsg = data.proof
-        ? `✅ Executed! ${data.proof.recipient?.slice(0,10)}… ${data.proof.balanceBefore} → ${data.proof.balanceAfter} ETH (${data.proof.netSign ?? '+'}${data.proof.netChange} ETH)`
-        : logLines[logLines.length - 1] || 'Action completed.';
-
-      setSubmitStatuses(prev => ({
-        ...prev,
-        [proposalId]: { type: 'success', message: successMsg, proof: data.proof, log: logLines }
-      }));
-      await fetchProposals();
     } catch (err) {
-      console.error('Error triggering action:', err);
-      setSubmitStatuses(prev => ({
-        ...prev,
-        [proposalId]: { type: 'error', message: err.message }
-      }));
+      console.error('[execute]', err);
+      const isDefeated    = err.message?.includes('defeated') || err.message?.includes('majority voted');
+      const isVotingActive = err.message?.includes('Voting period still active');
+      setStatus(proposalId, { type: 'error', message: err.message, isDefeated, isVotingActive });
     } finally {
-      setIsSubmittingMap(prev => ({ ...prev, [proposalId]: false }));
+      setStepSubmitting(prev => ({ ...prev, [proposalId]: null }));
+      await fetchProposals();
     }
   };
+
 
   function stateLabel(s) {
     return ['Pending','Active','Canceled','Defeated','Succeeded','Queued','Expired','Executed'][s] ?? `State ${s}`;
@@ -441,11 +386,73 @@ const Results = ({ provider, address }) => {
                     </p>
                   )}
                 </div>
-                {proposal.status === 'EXECUTED' ? (
-                  <div className="badge" style={{ background: 'rgba(56, 189, 248, 0.1)', color: 'var(--accent-primary)', borderColor: 'rgba(56, 189, 248, 0.2)' }}>Executed</div>
-                ) : (
+              {/* Status badge: rich multi-state */}
+              {(() => {
+                const s = proposalStates[proposal.proposalId];
+                const dbStatus = proposal.status;
+                // Prefer on-chain state; fall back to DB status
+                const isDefeated  = s === 3 || dbStatus === 'DEFEATED';
+                const isSucceeded = s === 4 && dbStatus !== 'EXECUTED';
+                const isExecuted  = s === 7 || dbStatus === 'EXECUTED';
+                const isQueued    = s === 5;
+                const isActive    = s === 1;
+                const isPending   = s === 0;
+
+                if (isDefeated) return (
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: 'rgba(239,68,68,0.15)', color: '#f87171',
+                    border: '1px solid rgba(239,68,68,0.35)',
+                    padding: '3px 12px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: 700
+                  }}>
+                    <XCircle size={12} /> Defeated
+                  </div>
+                );
+                if (isExecuted) return (
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: 'rgba(56,189,248,0.12)', color: 'var(--accent-primary)',
+                    border: '1px solid rgba(56,189,248,0.25)',
+                    padding: '3px 12px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: 700
+                  }}>
+                    <CheckCircle size={12} /> Executed
+                  </div>
+                );
+                if (isSucceeded) return (
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: 'rgba(16,185,129,0.12)', color: '#34d399',
+                    border: '1px solid rgba(16,185,129,0.3)',
+                    padding: '3px 12px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: 700
+                  }}>
+                    <CheckCircle size={12} /> Succeeded
+                  </div>
+                );
+                if (isQueued) return (
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: 'rgba(251,191,36,0.12)', color: '#fbbf24',
+                    border: '1px solid rgba(251,191,36,0.3)',
+                    padding: '3px 12px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: 700
+                  }}>
+                    Queued
+                  </div>
+                );
+                if (isActive) return (
                   <div className="badge badge-success">Active</div>
-                )}
+                );
+                if (isPending) return (
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: 'rgba(148,163,184,0.1)', color: '#94a3b8',
+                    border: '1px solid rgba(148,163,184,0.2)',
+                    padding: '3px 12px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: 700
+                  }}>
+                    Pending
+                  </div>
+                );
+                return <div className="badge badge-success">{dbStatus || 'Active'}</div>;
+              })()}
               </div>
 
               <p className="text-muted mb-4" style={{ fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -467,26 +474,52 @@ const Results = ({ provider, address }) => {
                 )}
               </p>
 
-              {proposalStates[proposal.proposalId] === 3 && totalVotes < Number(ethers.formatEther(proposalQuorums[proposal.proposalId] || '0')) && (
-                <div className="alert alert-info" style={{ 
-                  margin: '12px 0 24px', 
-                  padding: '12px', 
-                  background: 'rgba(239, 68, 68, 0.05)', 
-                  border: '1px solid rgba(239, 68, 68, 0.1)',
+              {/* Defeat Alert Banner */}
+              {(proposalStates[proposal.proposalId] === 3 || proposal.status === 'DEFEATED') && (
+                <div style={{
+                  margin: '12px 0 16px',
+                  padding: '14px 16px',
+                  background: 'rgba(239, 68, 68, 0.08)',
+                  border: '1px solid rgba(239, 68, 68, 0.25)',
+                  borderLeft: '4px solid #ef4444',
                   borderRadius: '8px',
                   display: 'flex',
-                  alignItems: 'center',
-                  gap: '10px',
-                  fontSize: '0.85rem',
-                  color: 'var(--text-muted)'
+                  alignItems: 'flex-start',
+                  gap: '12px',
+                  fontSize: '0.875rem'
                 }}>
-                  <Info size={16} className="text-danger" />
-                  <span>
-                    <strong>Quorum Not Met:</strong> This proposal is Defeated because it didn't reach the 40,000 token threshold. 
-                    <em> (Note: In Demo Mode with 0% Quorum, this usually means the Voting Period ended before the Tally was pushed.)</em>
-                  </span>
+                  <AlertTriangle size={18} style={{ color: '#f87171', flexShrink: 0, marginTop: '1px' }} />
+                  <div>
+                    <p style={{ color: '#f87171', fontWeight: 700, marginBottom: '2px' }}>❌ Proposal Defeated</p>
+                    <p style={{ color: 'var(--text-muted)', margin: 0 }}>
+                      Majority voted <strong>Against</strong> (or quorum not met). Execution is permanently blocked for this proposal.
+                    </p>
+                  </div>
                 </div>
               )}
+
+              {/* Quorum-only defeat note (no majority defeat — just quorum) */}
+              {proposalStates[proposal.proposalId] === 3
+                && proposal.status !== 'DEFEATED'
+                && (() => {
+                  const q = proposalQuorums[proposal.proposalId];
+                  const totalVotes = calculateTotal(proposal.results);
+                  if (!q || Number(q) === 0) return null;
+                  const qNum = Number(ethers.formatEther(q));
+                  if (totalVotes >= qNum) return null; // quorum met — this was a majority defeat
+                  return (
+                    <div style={{
+                      marginBottom: '16px', padding: '10px 14px',
+                      background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.15)',
+                      borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '8px',
+                      fontSize: '0.82rem', color: 'var(--text-muted)'
+                    }}>
+                      <Info size={14} style={{ color: 'var(--danger)' }} />
+                      <span><strong>Quorum Not Met:</strong> {qNum.toFixed(0)} votes required — only {totalVotes} cast.</span>
+                    </div>
+                  );
+                })()
+              }
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginBottom: '24px' }}>
                 {OPTIONS.map(opt => {
@@ -521,91 +554,183 @@ const Results = ({ provider, address }) => {
               </div>
 
               <div className="mt-4 pt-4" style={{ borderTop: '1px solid var(--panel-border)' }}>
-                <div className="flex gap-2 mb-4 overflow-x-auto pb-2">
-                  {[
-                    { state: 1, label: 'Push Tally' },
-                    { state: 4, label: 'Queue' },
-                    { state: 5, label: 'Execute' }
-                  ].map(stage => {
-                    const active = proposalStates[proposal.proposalId] === stage.state;
-                    const completed = proposalStates[proposal.proposalId] > stage.state || proposal.status === 'EXECUTED';
-                    return (
-                      <div key={stage.state} style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        gap: '4px',
-                        padding: '4px 12px',
-                        borderRadius: '20px',
-                        fontSize: '0.75rem',
-                        fontWeight: 600,
-                        whiteSpace: 'nowrap',
-                        background: active ? 'rgba(0, 255, 136, 0.1)' : completed ? 'rgba(255, 255, 255, 0.05)' : 'transparent',
-                        color: active ? 'var(--accent-primary)' : completed ? 'var(--text-muted)' : 'rgba(255, 255, 255, 0.2)',
-                        border: `1px solid ${active ? 'var(--accent-primary)' : 'transparent'}`
-                      }}>
-                        {completed ? <CheckCircle size={12} /> : <span>{stage.state === 1 ? '1' : stage.state === 4 ? '2' : '3'}</span>}
-                        {stage.label}
-                      </div>
-                    );
-                  })}
-                </div>
-
+                {/* ── Step progress indicator ──────────────────────────────── */}
                 {(() => {
-                  const props = getButtonProps(proposal);
+                  const s   = proposalStates[proposal.proposalId];
+                  const db  = proposal.status;
+                  const STAGES = [
+                    { key: 'tally',   chainState: 1, step: 1, label: 'Push Tally' },
+                    { key: 'queue',   chainState: 4, step: 2, label: 'Queue' },
+                    { key: 'execute', chainState: 5, step: 3, label: 'Execute' }
+                  ];
+                  const defeated = s === 3 || db === 'DEFEATED';
                   return (
-                    <button 
-                      onClick={() => handleFinalizeAction(proposal)}
-                      className={`btn ${props.variant === 'danger' ? 'btn-danger' : 'btn-primary'}`} 
-                      style={{ 
-                        width: '100%', 
-                        padding: '12px', 
-                        fontSize: '0.95rem', 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        justifyContent: 'center', 
-                        gap: '8px',
-                        opacity: props.disabled ? 0.6 : 1
-                      }}
-                      disabled={isSubmitting || props.disabled}
-                    >
-                      <RefreshCw size={16} className={isSubmitting ? 'spin' : ''} />
-                      {isSubmitting ? 'Processing...' : props.label}
-                    </button>
+                    <div className="flex gap-2 mb-4 overflow-x-auto pb-2">
+                      {STAGES.map(stage => {
+                        const active    = s === stage.chainState;
+                        const completed = !defeated && (s > stage.chainState || db === 'EXECUTED'
+                          || (stage.chainState === 4 && s === 5));
+                        const pill = {
+                          display: 'flex', alignItems: 'center', gap: '4px',
+                          padding: '4px 12px', borderRadius: '20px',
+                          fontSize: '0.75rem', fontWeight: 600, whiteSpace: 'nowrap',
+                          background: defeated
+                            ? 'rgba(239,68,68,0.08)'
+                            : active    ? 'rgba(0,255,136,0.1)'
+                            : completed ? 'rgba(255,255,255,0.05)' : 'transparent',
+                          color: defeated
+                            ? 'rgba(248,113,113,0.6)'
+                            : active    ? 'var(--accent-primary)'
+                            : completed ? 'var(--text-muted)' : 'rgba(255,255,255,0.2)',
+                          border: `1px solid ${active && !defeated ? 'var(--accent-primary)' : 'transparent'}`
+                        };
+                        return (
+                          <div key={stage.key} style={pill}>
+                            {completed ? <CheckCircle size={12}/> : defeated ? <XCircle size={12}/> : <span>{stage.step}</span>}
+                            {stage.label}
+                          </div>
+                        );
+                      })}
+                    </div>
                   );
                 })()}
 
-                {submitStatus && (
-                  <div className="mt-3" style={{ 
-                    background: submitStatus.type === 'success' ? 'rgba(16, 185, 129, 0.05)' : 'rgba(239, 68, 68, 0.05)', 
-                    borderColor: submitStatus.type === 'success' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)',
-                    borderWidth: '1px', borderStyle: 'solid', borderRadius: '8px', padding: '12px'
-                  }}>
-                    <span style={{ color: submitStatus.type === 'success' ? 'var(--success)' : 'var(--danger)', fontWeight: 600 }}>
-                      {submitStatus.type === 'success' ? '✅ Success' : '❌ Error'}
-                    </span>
-                    <p style={{ fontSize: '0.85rem', marginTop: '4px', color: 'var(--text-muted)' }}>{submitStatus.message}</p>
-                    {/* ETH Transfer Proof Panel */}
-                    {submitStatus.proof && (
-                      <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(0,255,136,0.05)', borderRadius: '6px', border: '1px solid rgba(0,255,136,0.15)' }}>
-                        <p style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '6px' }}>⚡ ETH Transfer Proof</p>
-                        <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
-                          <tbody>
-                            <tr><td style={{ color: 'var(--text-muted)', paddingRight: '12px' }}>Recipient</td><td style={{ fontFamily: 'monospace', color: 'var(--text-main)' }}>{submitStatus.proof.recipient}</td></tr>
-                            <tr><td style={{ color: 'var(--text-muted)' }}>Before</td><td style={{ color: 'var(--text-main)' }}>{submitStatus.proof.balanceBefore} ETH</td></tr>
-                            <tr><td style={{ color: 'var(--text-muted)' }}>After</td><td style={{ color: 'var(--accent-primary)', fontWeight: 600 }}>{submitStatus.proof.balanceAfter} ETH</td></tr>
-                            <tr><td style={{ color: 'var(--text-muted)' }}>Net Change</td><td style={{ color: 'var(--success)', fontWeight: 700 }}>{submitStatus.proof.netSign ?? '+'}{submitStatus.proof.netChange} ETH</td></tr>
-                            {submitStatus.proof.walletImpact && (
-                              <tr>
-                                <td style={{ color: 'var(--text-muted)' }}>Wallet Impact</td>
-                                <td style={{ color: 'var(--danger)', fontWeight: 600 }}>{submitStatus.proof.walletSign}{submitStatus.proof.walletImpact} ETH (incl. gas)</td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                )}
+                {/* ── Per-stage action buttons ─────────────────────────────── */}
+                {(() => {
+                  const s          = proposalStates[proposal.proposalId];
+                  const db         = proposal.status;
+                  const isDeposit  = proposal.direction === 'deposit';
+                  const isDefeated = s === 3 || db === 'DEFEATED';
+                  const isDone     = s === 7 || db === 'EXECUTED';
+                  const tallyBusy  = stepSubmitting[proposal.proposalId] === 'tally';
+                  const execBusy   = stepSubmitting[proposal.proposalId] === 'execute';
+
+                  const btnBase = {
+                    width: '100%', padding: '12px', fontSize: '0.95rem',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+                  };
+
+                  if (isDone) return (
+                    <div style={{ ...btnBase, background: 'rgba(56,189,248,0.07)',
+                      border: '1px solid rgba(56,189,248,0.2)', borderRadius: '8px',
+                      color: 'var(--accent-primary)', fontWeight: 600, fontSize: '0.9rem' }}>
+                      <CheckCircle size={16}/> Proposal Executed — Complete
+                    </div>
+                  );
+
+                  if (isDefeated) return (
+                    <div style={{ ...btnBase, background: 'rgba(239,68,68,0.08)',
+                      border: '1px solid rgba(239,68,68,0.25)', borderRadius: '8px',
+                      color: '#f87171', fontWeight: 600, fontSize: '0.9rem',
+                      flexDirection: 'column', gap: '4px' }}>
+                      <span><XCircle size={15} style={{verticalAlign:'middle',marginRight:'6px'}}/>Proposal Defeated — Cannot Execute</span>
+                      <span style={{fontSize:'0.78rem',opacity:0.7,fontWeight:400}}>Majority voted Against or quorum not met.</span>
+                    </div>
+                  );
+
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {/* Push Tally — shown when Active (1) */}
+                      {s === 1 && (
+                        <button onClick={() => handlePushTally(proposal)}
+                          disabled={tallyBusy} className="btn btn-primary" style={btnBase}>
+                          <RefreshCw size={16} className={tallyBusy ? 'spin' : ''}/>
+                          {tallyBusy ? 'Pushing Tally…' : '📊 Push Tally to Chain'}
+                        </button>
+                      )}
+
+                      {/* Queue & Execute — shown when Succeeded (4) */}
+                      {s === 4 && (
+                        <button onClick={() => handleExecute(proposal)}
+                          disabled={execBusy} className="btn btn-primary" style={btnBase}>
+                          <RefreshCw size={16} className={execBusy ? 'spin' : ''}/>
+                          {execBusy ? 'Queueing & Executing…' : '🚀 Queue & Execute'}
+                        </button>
+                      )}
+
+                      {/* Execute Now — shown when Queued (5) */}
+                      {s === 5 && (
+                        <button onClick={() => handleExecute(proposal)}
+                          disabled={execBusy} className="btn btn-primary" style={btnBase}>
+                          <RefreshCw size={16} className={execBusy ? 'spin' : ''}/>
+                          {execBusy ? 'Executing…' : '⚡ Execute Now'}
+                        </button>
+                      )}
+
+                      {/* Deposit: Send ETH — shown when tally done but not yet executed */}
+                      {isDeposit && (s === 4 || s === 5 || s === undefined) && (
+                        <button onClick={() => handleExecute(proposal)}
+                          disabled={execBusy} className="btn btn-primary" style={btnBase}>
+                          <RefreshCw size={16} className={execBusy ? 'spin' : ''}/>
+                          {execBusy ? 'Sending ETH…' : '💳 Send ETH to Treasury'}
+                        </button>
+                      )}
+
+                      {/* Pending — waiting for activation */}
+                      {s === 0 && (
+                        <div style={{ ...btnBase, background: 'rgba(255,255,255,0.03)',
+                          border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px',
+                          color: 'var(--text-muted)', fontSize: '0.88rem' }}>
+                          ⏳ Pending — awaiting voting delay…
+                        </div>
+                      )}
+
+                      {/* Active (voting) — no tally button for deposit */}
+                      {s === 1 && isDeposit && (
+                        <div style={{ ...btnBase, background: 'rgba(255,255,255,0.03)',
+                          border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px',
+                          color: 'var(--text-muted)', fontSize: '0.88rem' }}>
+                          🗳️ Voting in Progress — cast your votes then push tally
+                        </div>
+                      )}
+
+                      {/* Unknown state — prompt refresh */}
+                      {s === undefined && !isDeposit && (
+                        <button onClick={fetchProposals} className="btn btn-primary" style={btnBase}>
+                          <RefreshCw size={16}/> Refresh State
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {submitStatus && (() => {
+                  const t = submitStatus.type;
+                  const isDefeated    = t === 'defeated' || submitStatus.isDefeated;
+                  const isVotingActive = submitStatus.isVotingActive;
+                  const isInfo        = t === 'info';
+                  const isSuccess     = t === 'success';
+                  const bg    = isSuccess ? 'rgba(16,185,129,0.05)' : isVotingActive ? 'rgba(251,191,36,0.08)' : isDefeated ? 'rgba(239,68,68,0.08)' : isInfo ? 'rgba(56,189,248,0.07)' : 'rgba(239,68,68,0.05)';
+                  const bc    = isSuccess ? 'rgba(16,185,129,0.2)'  : isVotingActive ? 'rgba(251,191,36,0.35)' : isDefeated ? 'rgba(239,68,68,0.3)'  : isInfo ? 'rgba(56,189,248,0.2)'  : 'rgba(239,68,68,0.2)';
+                  const bleft = isVotingActive ? '4px solid #fbbf24' : isDefeated ? '4px solid #ef4444' : isInfo ? '4px solid var(--accent-secondary)' : undefined;
+                  const labelColor = isSuccess ? 'var(--success)' : isVotingActive ? '#fbbf24' : isInfo ? 'var(--accent-secondary)' : 'var(--danger)';
+                  const label = isSuccess ? '✅ Success' : isVotingActive ? '🗳️ Voting Active' : isDefeated ? '❌ Proposal Defeated' : isInfo ? 'ℹ️ Action Required' : '❌ Error';
+                  return (
+                    <div className="mt-3" style={{ background: bg, borderColor: bc, borderLeft: bleft, borderWidth: '1px', borderStyle: 'solid', borderRadius: '8px', padding: '12px' }}>
+                      <span style={{ color: labelColor, fontWeight: 600 }}>{label}</span>
+                      <p style={{ fontSize: '0.85rem', marginTop: '4px', color: 'var(--text-muted)' }}>{submitStatus.message}</p>
+                      {submitStatus.proof && (
+                        <div style={{ marginTop: '10px', padding: '10px', background: 'rgba(0,255,136,0.05)', borderRadius: '6px', border: '1px solid rgba(0,255,136,0.15)' }}>
+                          <p style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '6px' }}>⚡ ETH Transfer Proof</p>
+                          <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse' }}>
+                            <tbody>
+                              <tr><td style={{ color: 'var(--text-muted)', paddingRight: '12px' }}>Recipient</td><td style={{ fontFamily: 'monospace', color: 'var(--text-main)' }}>{submitStatus.proof.recipient}</td></tr>
+                              <tr><td style={{ color: 'var(--text-muted)' }}>Before</td><td style={{ color: 'var(--text-main)' }}>{submitStatus.proof.balanceBefore} ETH</td></tr>
+                              <tr><td style={{ color: 'var(--text-muted)' }}>After</td><td style={{ color: 'var(--accent-primary)', fontWeight: 600 }}>{submitStatus.proof.balanceAfter} ETH</td></tr>
+                              <tr><td style={{ color: 'var(--text-muted)' }}>Net Change</td><td style={{ color: 'var(--success)', fontWeight: 700 }}>{submitStatus.proof.netSign ?? '+'}{submitStatus.proof.netChange} ETH</td></tr>
+                              {submitStatus.proof.walletImpact && (
+                                <tr>
+                                  <td style={{ color: 'var(--text-muted)' }}>Wallet Impact</td>
+                                  <td style={{ color: 'var(--danger)', fontWeight: 600 }}>{submitStatus.proof.walletSign}{submitStatus.proof.walletImpact} ETH (incl. gas)</td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
             </div>

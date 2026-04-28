@@ -239,6 +239,22 @@ const CastVote = ({ provider, address }) => {
           {isCasting ? 'Generating proof & waiting for signature…' : !address ? 'Please connect a wallet to continue' : (!delegationStatus || votingPower === '0') ? 'No Voting Power / Not Delegated' : 'Generate Proof & Submit Vote'}
         </button>
 
+        {/* What happens next — lifecycle explainer */}
+        <div style={{
+          marginTop: '16px', padding: '12px 16px',
+          background: 'rgba(56,189,248,0.06)',
+          border: '1px solid rgba(56,189,248,0.18)',
+          borderRadius: '8px', fontSize: '0.82rem', color: 'var(--text-muted)',
+          lineHeight: 1.6
+        }}>
+          <p style={{ fontWeight: 700, color: 'var(--accent-primary)', marginBottom: '4px' }}>📋 What happens next?</p>
+          <ol style={{ paddingLeft: '18px', margin: 0 }}>
+            <li>Your vote is recorded in the backend during the <strong>Active</strong> voting window.</li>
+            <li>Once all votes are cast, go to <strong>Voting Results</strong> and click <strong>"Push Tally"</strong> to close the window and determine the outcome.</li>
+            <li>If the proposal <strong>Succeeded</strong>, click <strong>"Queue & Execute"</strong> to finalise on-chain.</li>
+          </ol>
+        </div>
+
         {status && (
           <div
             className="glass-panel mt-4"

@@ -176,82 +176,61 @@ app.post('/admin/setup-voter', async (req, res) => {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTO-LIFECYCLE: immediately advance proposal to Succeeded state in background.
-// Called right after a proposal is saved to DB, so the 50-block voting window
-// doesn't expire before the user can interact with the UI.
+// AUTO-ACTIVATE: mines past votingDelay so the proposal becomes Active on-chain.
+// Deliberately does NOT vote, does NOT mine past the votingPeriod, and does NOT
+// write SUCCEEDED/DEFEATED. The proposal stays Active so real user votes can
+// accumulate during the full voting window.
+//
+// Finalization (mine period + read outcome + write DB) happens only when the
+// user clicks "Push Tally" in the UI → POST /submit/:proposalId.
 // ─────────────────────────────────────────────────────────────────────────────
-async function autoAdvanceToSucceeded(proposalId) {
-  // Serialize through the mutex — cannot race with /submit or /execute
+async function autoActivateProposal(proposalId) {
   return withSignerLock(async () => {
     try {
       const { provider, signer, governor } = await getGovernorSigner();
-      const votingDelay  = Number(await governor.votingDelay());
-      const votingPeriod = Number(await governor.votingPeriod());
-      const nm = await new NonceManager(provider, signer.address).init();
+      const votingDelay = Number(await governor.votingDelay());
 
       let state = Number(await governor['state(uint256)'](proposalId));
-      console.log(`[auto-tally] ${proposalId.slice(0,10)}... state: ${state} (${stateLabel(state)})`);
+      console.log(`[activate] ${proposalId.slice(0,10)}... initial state: ${state} (${stateLabel(state)})`);
 
-      // ── Guard: ensure signer has voting power before we try to vote ────────
-      // GovernorVotes uses checkpoints — if setupVoter.js wasn't run after a
-      // fresh Hardhat node start, getVotes(signer) = 0 and every vote counts
-      // as 0 weight, causing Defeated even with quorum=0%.  Auto-delegate here
-      // so the relayer always has enough weight regardless of manual setup.
+      // ── Ensure relayer has voting power so it can vote at push-tally time ──
+      // We auto-delegate HERE (not at vote time) so the checkpoint is recorded
+      // before the proposal snapshot block. Delegation after snapshot = 0 weight.
       const addrs = getAddresses();
       const TOKEN_ABI = [
         'function getVotes(address account) external view returns (uint256)',
-        'function delegate(address delegatee) external'
+        'function delegate(address delegatee) external',
+        'function totalSupply() external view returns (uint256)'
       ];
       if (addrs.tokenAddress) {
+        const nm = await new NonceManager(provider, signer.address).init();
         const tokenContract = new ethers.Contract(addrs.tokenAddress, TOKEN_ABI, signer);
         const currentVotes = await tokenContract.getVotes(signer.address);
         if (currentVotes === 0n) {
-          console.log(`[auto-tally] Signer has 0 votes — auto-delegating to self...`);
+          console.log(`[activate] Signer has 0 votes — auto-delegating to self...`);
           const delTx = await tokenContract.delegate(signer.address, { nonce: nm.consume() });
           await delTx.wait();
-          console.log(`[auto-tally] Delegation tx: ${delTx.hash}`);
-          // Re-init nonce since a tx was sent outside nm.sendTx
-          await nm.init();
+          console.log(`[activate] Delegation tx: ${delTx.hash}`);
         } else {
-          console.log(`[auto-tally] Signer votes: ${ethers.formatEther(currentVotes)} GOV`);
+          console.log(`[activate] Signer votes: ${ethers.formatEther(currentVotes)} GOV`);
         }
       }
-      // ──────────────────────────────────────────────────────────────────────
 
-      // Pending → Active
+      // ── Mine past votingDelay only — proposal becomes Active ───────────────
       if (state === 0) {
         await mineBlocks(provider, votingDelay + 1);
         state = Number(await governor['state(uint256)'](proposalId));
-        console.log(`[auto-tally] After delay mine: ${state} (${stateLabel(state)})`);
+        console.log(`[activate] After delay mine: ${state} (${stateLabel(state)})`);
       }
 
-      if (state !== 1) {
-        console.warn(`[auto-tally] Expected Active (1), got ${state}. Aborting.`);
-        return;
-      }
-
-      // Cast on-chain vote — nonce tracked by NonceManager
-      const alreadyVoted = await governor.hasVoted(proposalId, signer.address);
-      if (!alreadyVoted) {
-        const { tx } = await nm.sendTx(governor, 'castVoteWithReason', [proposalId, 1, 'Auto-relayer: for']);
-        console.log(`[auto-tally] Vote cast. Tx: ${tx.hash}`);
+      if (state === 1) {
+        console.log(`[activate] ✅ ${proposalId.slice(0,10)}... is now Active. Voting window open.`);
+        console.log(`[activate] ℹ️  Voting period NOT advanced — users may cast votes. Click "Push Tally" when ready.`);
       } else {
-        console.log(`[auto-tally] Already voted.`);
-      }
-
-      // Mine past voting period → Succeeded
-      await mineBlocks(provider, votingPeriod + 1);
-      state = Number(await governor['state(uint256)'](proposalId));
-      console.log(`[auto-tally] After period mine: ${state} (${stateLabel(state)})`);
-
-      if (state === 4) {
-        await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }, { returnDocument: 'after' }).catch(() => {});
-        console.log(`[auto-tally] ✅ ${proposalId.slice(0,10)}... SUCCEEDED.`);
-      } else {
-        console.warn(`[auto-tally] ⚠️ Expected Succeeded (4), got ${state}.`);
+        console.warn(`[activate] ⚠️ Expected Active (1) after delay mine, got ${state} (${stateLabel(state)}). No further action.`);
       }
     } catch (e) {
-      console.error(`[auto-tally] Error:`, e.reason || e.message);
+      console.error(`[activate] Error:`, e.reason || e.message);
     }
   });
 }
@@ -435,8 +414,8 @@ app.post('/propose', async (req, res) => {
       }
     }
 
-    console.log(`[propose] Triggering auto-tally for ${shortId}.`);
-    setImmediate(() => autoAdvanceToSucceeded(proposalId));
+    console.log(`[propose] Triggering auto-activate for ${shortId} (mines votingDelay only — voting window stays open).`);
+    setImmediate(() => autoActivateProposal(proposalId));
 
     return res.status(201).json({ success: true, proposalId, shortId, autoTally: true });
   } catch (error) {
@@ -558,7 +537,7 @@ app.get('/proposals', async (req, res) => {
   try {
     const proposals = await Proposal.aggregate([
       { $lookup: { from: 'votes', localField: 'proposalId', foreignField: 'proposalId', as: 'votes' } },
-      { $project: { proposalId: 1, shortId: 1, proposerAddress: 1, description: 1, target: 1, value: 1, calldata: 1, timestamp: 1, status: 1, recipient: 1, amount: 1, direction: 1, votes: { choice: 1, zkProofVersion: 1 } } },
+      { $project: { proposalId: 1, shortId: 1, proposerAddress: 1, description: 1, target: 1, value: 1, calldata: 1, timestamp: 1, status: 1, recipient: 1, amount: 1, direction: 1, executionEvent: 1, votes: { choice: 1, zkProofVersion: 1 } } },
       { $sort: { timestamp: -1 } }
     ]);
     const formatted = proposals.map(p => {
@@ -585,14 +564,30 @@ app.get('/proposals', async (req, res) => {
   }
 });
 
-// 3. Status Update (called by scripts)
+// 3. Status Update (called by scripts and frontend)
+// GUARD: A DEFEATED proposal can never be promoted to EXECUTED.
+// This prevents race conditions where a stale deposit event or UI call
+// tries to mark a defeated proposal as executed.
 app.patch('/proposals/:proposalId/status', async (req, res) => {
   try {
     const { proposalId } = req.params;
     const { status } = req.body;
+
+    // Safety guard: read current status before updating
+    const existing = await Proposal.findOne({ proposalId });
+    if (!existing) return res.status(404).json({ error: 'Not found' });
+
+    if (existing.status === 'DEFEATED' && status === 'EXECUTED') {
+      console.warn(`[db] ⛔ Blocked attempt to set EXECUTED on DEFEATED proposal ${proposalId.slice(0,10)}...`);
+      return res.status(409).json({
+        error: 'Cannot mark a Defeated proposal as Executed.',
+        currentStatus: 'DEFEATED'
+      });
+    }
+
     const proposal = await Proposal.findOneAndUpdate({ proposalId }, { status }, { returnDocument: 'after' });
     if (!proposal) return res.status(404).json({ error: 'Not found' });
-    console.log(`[db] ${proposalId} -> ${status}`);
+    console.log(`[db] ${proposalId.slice(0,10)}... -> ${status}`);
     res.json({ success: true, proposal });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -745,7 +740,16 @@ app.post('/submit/:proposalId', async (req, res) => {
         console.log(`[pushTally] ${log[log.length - 1]}`);
       }
 
-      // State 4 (Succeeded) means autoAdvanceToSucceeded already ran —
+      // State 3 (Defeated) — Against >= For or quorum not met.
+      // Persist to DB and return a structured response (not an error).
+      if (state === 3) {
+        log.push('❌ Proposal is Defeated on-chain (majority Against or quorum not met).');
+        console.log('[pushTally] Defeated — writing DEFEATED to DB.');
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'DEFEATED' }, { returnDocument: 'after' }).catch(() => {});
+        return { state, stateLabel: stateLabel(state), log, defeated: true };
+      }
+
+      // State 4 (Succeeded) means autoTallyProposal already ran —
       // treat as success so the UI can move straight to Queue & Execute.
       if (state === 4) {
         log.push('Proposal already Succeeded — tally was pushed automatically.');
@@ -761,14 +765,29 @@ app.post('/submit/:proposalId', async (req, res) => {
 
       const nm = await new NonceManager(provider, signer.address).init();
 
+      // ── Aggregate off-chain votes from the Vote collection ──────────────────
+      // Votes are stored per-document in the Vote collection (choice: 0/1/2).
+      // The Proposal document has NO embedded results field — do NOT read
+      // dbProposal.results (it is always undefined and defaults to {}).
+      const allVotes        = await Vote.find({ proposalId }).lean();
+      const offchainFor     = allVotes.filter(v => v.choice === 1).length;
+      const offchainAgainst = allVotes.filter(v => v.choice === 0).length;
+      const offchainAbstain = allVotes.filter(v => v.choice === 2).length;
+      const relayerVote  = offchainFor > offchainAgainst ? 1 : 0;
+      const relayerLabel = relayerVote === 1 ? 'For' : 'Against';
+      log.push(`Off-chain tally: For=${offchainFor}, Against=${offchainAgainst}, Abstain=${offchainAbstain} → relayer votes ${relayerLabel}`);
+      console.log(`[pushTally] ${log[log.length - 1]}`);
+
       const alreadyVoted = await governor.hasVoted(proposalId, signer.address);
       if (!alreadyVoted) {
-        log.push('Casting "For" vote on-chain...');
-        const { tx } = await nm.sendTx(governor, 'castVoteWithReason', [proposalId, 1, 'Relayer: for']);
+        log.push(`Casting "${relayerLabel}" vote on-chain...`);
+        const { tx } = await nm.sendTx(governor, 'castVoteWithReason', [
+          proposalId, relayerVote, `Relayer: ${relayerLabel} (For=${offchainFor} Against=${offchainAgainst} Abstain=${offchainAbstain})`
+        ]);
         log.push(`Vote cast. Tx: ${tx.hash}`);
         console.log(`[pushTally] Vote tx: ${tx.hash}`);
       } else {
-        log.push('Already voted on-chain.');
+        log.push('Already voted on-chain (relayer vote direction already recorded).');
       }
 
       await mineBlocks(provider, votingPeriod + 1);
@@ -779,13 +798,21 @@ app.post('/submit/:proposalId', async (req, res) => {
       if (state === 4) {
         await Proposal.findOneAndUpdate({ proposalId }, { status: 'SUCCEEDED' }, { returnDocument: 'after' }).catch(() => {});
         log.push('✅ Proposal Succeeded!');
+      } else if (state === 3) {
+        // Defeated after voting period: majority Against or quorum not met
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'DEFEATED' }, { returnDocument: 'after' }).catch(() => {});
+        log.push('❌ Proposal Defeated — majority voted Against or quorum not met.');
+        console.log('[pushTally] ❌ Defeated — DB updated to DEFEATED.');
+        return { state, stateLabel: stateLabel(state), log, defeated: true };
       } else {
-        log.push(`⚠️ Expected Succeeded (4), got ${state}.`);
+        log.push(`⚠️ Unexpected state after period: ${state} (${stateLabel(state)}).`);
       }
       return { state, stateLabel: stateLabel(state), log };
     });
 
-    return res.json({ success: result.state === 4, ...result });
+    // Defeated is a valid outcome — success:false but HTTP 200
+    const isDefeated = result.defeated === true;
+    return res.json({ success: result.state === 4, defeated: isDefeated, ...result });
   } catch (e) {
     console.error('[pushTally] Error:', e.message);
     const code = e.userError ? 400 : 500;
@@ -859,21 +886,72 @@ app.post('/execute/:proposalId', async (req, res) => {
       log.push(`Initial state: ${state} (${stateLabel(state)})`);
       console.log(`[execute] ${log[log.length - 1]}`);
 
-      // Advance from Pending/Active if needed
+      // ── Guard: voting still active ─────────────────────────────────────────
+      // The proposal is in the Active window — votes are still being cast.
+      // Execution is only valid after the voting period ends and the outcome is
+      // Succeeded (4). Tell the user to click "Push Tally" first.
+      if (state === 1) {
+        throw Object.assign(
+          new Error('Voting period still active — cast your votes first, then click "Push Tally" to close the window.'),
+          { state: 1, userError: true, votingActive: true }
+        );
+      }
+
+      // ── Guard: Pending (proposal not yet Active) ───────────────────────────
+      if (state === 0) {
+        throw Object.assign(
+          new Error('Proposal is still Pending — the voting delay has not elapsed yet.'),
+          { state: 0, userError: true }
+        );
+      }
+
+      // ── Guard: Defeated ────────────────────────────────────────────────────
+      if (state === 3) {
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'DEFEATED' }, { returnDocument: 'after' }).catch(() => {});
+        throw Object.assign(
+          new Error('Proposal defeated — majority voted Against or quorum not met.'),
+          { state: 3, userError: true, defeated: true }
+        );
+      }
+
+      // Advance from Pending/Active if needed (legacy path — should not be reached
+      // with the new lifecycle, but kept as a safety net for manual testing)
       if (state === 0) {
         await mineBlocks(provider, votingDelay + 1);
         state = Number(await governor['state(uint256)'](proposalId));
         log.push(`Mined to Active: ${state}`);
       }
       if (state === 1) {
+        // Aggregate off-chain votes from Vote collection (same as pushTally)
+        const exAllVotes = await Vote.find({ proposalId }).lean();
+        const exFor      = exAllVotes.filter(v => v.choice === 1).length;
+        const exAgainst  = exAllVotes.filter(v => v.choice === 0).length;
+        const exAbstain  = exAllVotes.filter(v => v.choice === 2).length;
+        const exVote     = exFor > exAgainst ? 1 : 0;
+        const exLabel    = exVote === 1 ? 'For' : 'Against';
+        log.push(`Off-chain tally: For=${exFor}, Against=${exAgainst}, Abstain=${exAbstain} → relayer votes ${exLabel}`);
+        console.log(`[execute] ${log[log.length - 1]}`);
         const alreadyVoted = await governor.hasVoted(proposalId, signer.address);
         if (!alreadyVoted) {
-          const { tx } = await nm.sendTx(governor, 'castVoteWithReason', [proposalId, 1, 'Finalizer: for']);
-          log.push(`Vote cast. Tx: ${tx.hash}`);
+          const { tx } = await nm.sendTx(governor, 'castVoteWithReason', [
+            proposalId, exVote, `Finalizer: ${exLabel} (For=${exFor} Against=${exAgainst} Abstain=${exAbstain})`
+          ]);
+          log.push(`Vote cast (${exLabel}). Tx: ${tx.hash}`);
         }
         await mineBlocks(provider, votingPeriod + 1);
         state = Number(await governor['state(uint256)'](proposalId));
         log.push(`After period mine: ${state} (${stateLabel(state)})`);
+      }
+
+      // ── Post-mine Defeated check ───────────────────────────────────────────
+      // Even after we mine past the period, the chain may return Defeated if
+      // real user votes showed Against >= For or quorum wasn't met.
+      if (state === 3) {
+        await Proposal.findOneAndUpdate({ proposalId }, { status: 'DEFEATED' }, { returnDocument: 'after' }).catch(() => {});
+        throw Object.assign(
+          new Error('Proposal defeated — majority voted Against.'),
+          { state: 3, userError: true, defeated: true }
+        );
       }
 
       if (state !== 4) {
@@ -1001,7 +1079,12 @@ app.post('/execute/:proposalId', async (req, res) => {
   } catch (e) {
     console.error('[execute] Error:', e.reason || e.message);
     const code = e.userError ? 400 : 500;
-    return res.status(code).json({ error: e.reason || e.message, state: e.state });
+    return res.status(code).json({
+      error: e.reason || e.message,
+      state: e.state,
+      defeated:     e.defeated     === true,
+      votingActive: e.votingActive === true
+    });
   }
 });
 
@@ -1179,20 +1262,55 @@ if (require.main === module) {
                   console.log(`[deposit]   Wallet:    ${ethers.formatEther(wBefore)} -> ${ethers.formatEther(wAfter)} ETH  (${wNet >= 0n ? '+' : ''}${ethers.formatEther(wNet)})`);
                   console.log('[deposit] ==============================================');
                   const amountStr = parseFloat(amountEth).toString();
+
+                  // Build the on-chain event record for audit / reconciliation
+                  const executionEventData = {
+                    txHash:      evt.transactionHash,
+                    blockNumber: blockNum,
+                    from,
+                    to:          liveTreasuryAddress,
+                    amountEth,
+                    timestamp:   new Date()
+                  };
+
+                  // ── Pass 1: find a pending deposit proposal and mark EXECUTED ──
+                  // Guard: never overwrite DEFEATED status.
                   const updated = await Proposal.findOneAndUpdate(
                     {
                       direction: 'deposit',
                       target: { $regex: new RegExp('^' + liveTreasuryAddress + '$', 'i') },
-                      status: { $ne: 'EXECUTED' },
+                      status: { $nin: ['EXECUTED', 'DEFEATED'] },
                       $or: [{ amount: amountStr }, { amount: amountEth }, { value: amountStr }, { value: amount.toString() }]
                     },
-                    { status: 'EXECUTED' },
+                    { status: 'EXECUTED', executionEvent: executionEventData },
                     { sort: { timestamp: -1 }, returnDocument: 'after' }
                   ).catch(() => null);
+
                   if (updated) {
                     console.log(`[deposit] ✅ Marked ${updated.shortId} (${updated.proposalId.slice(0,10)}...) as EXECUTED`);
+                    console.log(`[deposit] ℹ️  executionEvent attached: tx=${evt.transactionHash.slice(0,12)}... block=${blockNum}`);
                   } else {
-                    console.log(`[deposit] ⚠️ No pending deposit proposal matched for ${amountEth} ETH from ${from}`);
+                    // ── Pass 2: proposal was already EXECUTED — attach executionEvent for audit ──
+                    // This happens when the frontend manually marks EXECUTED before the poller sees
+                    // the Deposit event (e.g. slow block time, restart). Reconcile without warning.
+                    const alreadyExecuted = await Proposal.findOneAndUpdate(
+                      {
+                        direction: 'deposit',
+                        target: { $regex: new RegExp('^' + liveTreasuryAddress + '$', 'i') },
+                        status: 'EXECUTED',
+                        executionEvent: { $exists: false }, // only attach once
+                        $or: [{ amount: amountStr }, { amount: amountEth }, { value: amountStr }, { value: amount.toString() }]
+                      },
+                      { executionEvent: executionEventData },
+                      { sort: { timestamp: -1 }, returnDocument: 'after' }
+                    ).catch(() => null);
+
+                    if (alreadyExecuted) {
+                      console.log(`[deposit] ℹ️  Reconciled: ${alreadyExecuted.shortId} already EXECUTED — executionEvent attached (tx=${evt.transactionHash.slice(0,12)}...).`);
+                    } else {
+                      // Genuinely no match — may be an unrelated Treasury deposit or a race
+                      console.log(`[deposit] ℹ️  Deposit of ${amountEth} ETH from ${from.slice(0,10)}... has no matching proposal (amount or direction mismatch). No action taken.`);
+                    }
                   }
                 } catch (parseErr) {
                   console.warn('[deposit] Event parse error:', parseErr.message);
