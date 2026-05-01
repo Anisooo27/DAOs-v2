@@ -15,6 +15,9 @@ import "@openzeppelin/contracts/governance/extensions/GovernorTimelockControl.so
 // ---------------- Timelock ----------------
 import "@openzeppelin/contracts/governance/TimelockController.sol";
 
+// ---------------- ERC20 (for balanceOf) ----------------
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 contract DAOGovernor is
     Governor,
     GovernorSettings,
@@ -23,8 +26,28 @@ contract DAOGovernor is
     GovernorVotesQuorumFraction,
     GovernorTimelockControl
 {
+    mapping(uint256 => bytes32) public proposalDescriptionHashes;
+
+    mapping(uint256 => mapping(address => bytes32)) public commitments;
+    mapping(uint256 => mapping(address => bool)) public hasRevealed;
+
+    event VoteCommitted(uint256 indexed proposalId, address indexed voter, bytes32 commitment);
+    event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 weight);
+    event RevealRejected(uint256 indexed proposalId, address indexed voter, string reason);
+    event VoteRejected(uint256 indexed proposalId, address indexed voter, string reason);
+
+    struct ProposalDetails {
+        uint256 proposalId;
+        address proposer;
+        bytes32 descriptionHash;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 abstainVotes;
+        ProposalState state;
+    }
+
     constructor(
-        IVotes token,
+        IVotes _token,
         TimelockController timelock
     )
         Governor("MyDAO")
@@ -33,10 +56,37 @@ contract DAOGovernor is
             50,     // voting period (~10 mins @ 12s/block, but much faster on local)
             0       // proposal threshold
         )
-        GovernorVotes(token)
-        GovernorVotesQuorumFraction(10) // 10% quorum: at least 10% of total GOV supply must vote
+        GovernorVotes(_token)
+        GovernorVotesQuorumFraction(0) // 0% quorum: balance-based, no checkpoint quorum needed
         GovernorTimelockControl(timelock)
     {}
+
+    function getProposalDetails(uint256 proposalId) public view returns (ProposalDetails memory) {
+        (uint256 againstVotes, uint256 forVotes, uint256 abstainVotes) = proposalVotes(proposalId);
+        return ProposalDetails({
+            proposalId: proposalId,
+            proposer: proposalProposer(proposalId),
+            descriptionHash: proposalDescriptionHashes[proposalId],
+            forVotes: forVotes,
+            againstVotes: againstVotes,
+            abstainVotes: abstainVotes,
+            state: state(proposalId)
+        });
+    }
+
+    // --------------------------------------------------
+    // Balance-Based Voting Power
+    // --------------------------------------------------
+    // Override _getVotes() so the Governor reads each voter's current
+    // token balance instead of delegation checkpoints.
+    // blockNumber is intentionally ignored — we use the live balance.
+    function _getVotes(
+        address account,
+        uint256 /* blockNumber */,
+        bytes memory /* params */
+    ) internal view override(Governor, GovernorVotes) returns (uint256) {
+        return IERC20(address(token)).balanceOf(account);
+    }
 
     // --------------------------------------------------
     // Required overrides (OpenZeppelin v5)
@@ -104,10 +154,6 @@ contract DAOGovernor is
     // We call super.state() to preserve those states, then add an explicit
     // belt-and-suspenders check: if the chain says Succeeded(4) but our strict
     // majority or quorum requirements are NOT met, we override to Defeated(3).
-    //
-    // In practice super.state() already calls _voteSucceeded() + quorumReached()
-    // because we override _voteSucceeded. This guard makes the logic unambiguous
-    // and protects against any future inheritance changes.
     function state(uint256 proposalId)
         public
         view
@@ -198,8 +244,13 @@ contract DAOGovernor is
         bytes[] memory calldatas,
         string memory description
     ) public override(Governor, IGovernor) returns (uint256) {
-        require(token.getVotes(msg.sender) > 0, "No voting power: wallet has not delegated");
-        return super.propose(targets, values, calldatas, description);
+        require(
+            IERC20(address(token)).balanceOf(msg.sender) > 0,
+            "No GOV tokens: wallet must hold GOV tokens to propose"
+        );
+        uint256 proposalId = super.propose(targets, values, calldatas, description);
+        proposalDescriptionHashes[proposalId] = keccak256(bytes(description));
+        return proposalId;
     }
 
     function _castVote(
@@ -209,7 +260,49 @@ contract DAOGovernor is
         string memory reason,
         bytes memory params
     ) internal override(Governor) returns (uint256) {
-        require(token.getVotes(account) > 0, "No voting power: wallet has not delegated");
+        require(
+            IERC20(address(token)).balanceOf(account) > 0,
+            "No GOV tokens: wallet must hold GOV tokens to vote"
+        );
         return super._castVote(proposalId, account, support, reason, params);
+    }
+
+    function commitVote(uint256 proposalId, bytes32 commitment) public {
+        require(state(proposalId) == ProposalState.Active, "Governor: vote not currently active");
+        if (commitments[proposalId][msg.sender] != bytes32(0)) {
+            emit VoteRejected(proposalId, msg.sender, "duplicate commit");
+            return;
+        }
+        
+        require(
+            IERC20(address(token)).balanceOf(msg.sender) > 0,
+            "No GOV tokens: wallet must hold GOV tokens to vote"
+        );
+
+        commitments[proposalId][msg.sender] = commitment;
+        emit VoteCommitted(proposalId, msg.sender, commitment);
+    }
+
+    function revealVote(uint256 proposalId, uint8 support, string memory secret) public {
+        require(state(proposalId) == ProposalState.Active, "Governor: vote not currently active");
+        
+        if (hasRevealed[proposalId][msg.sender]) {
+            emit RevealRejected(proposalId, msg.sender, "duplicate reveal");
+            return;
+        }
+        
+        bytes32 storedCommitment = commitments[proposalId][msg.sender];
+        require(storedCommitment != bytes32(0), "No commitment found");
+
+        bytes32 expectedCommitment = keccak256(abi.encodePacked(msg.sender, proposalId, support, secret));
+        
+        if (expectedCommitment != storedCommitment) {
+            emit RevealRejected(proposalId, msg.sender, "invalid secret");
+            return;
+        }
+        
+        hasRevealed[proposalId][msg.sender] = true;
+        uint256 weight = _castVote(proposalId, msg.sender, support, "");
+        emit VoteRevealed(proposalId, msg.sender, support, weight);
     }
 }

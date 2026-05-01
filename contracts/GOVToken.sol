@@ -13,6 +13,11 @@ contract GOVToken is ERC20, ERC20Permit, ERC20Votes {
         _mint(msg.sender, initialSupply);
     }
 
+    function faucetMint(uint256 amount) public {
+        require(amount <= 1000 ether, "Max 1000 GOV per call");
+        _mint(msg.sender, amount);
+    }
+
     // -------- REQUIRED OVERRIDES (OZ v4) --------
 
     function _afterTokenTransfer(

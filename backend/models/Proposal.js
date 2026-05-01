@@ -22,11 +22,13 @@ const proposalSchema = new mongoose.Schema({
   },
   target: {
     type: String,
-    required: true,
+    required: false,
+    default: '0x0000000000000000000000000000000000000000',
   },
   value: {
     type: String,
-    required: true,
+    required: false,
+    default: '0',
   },
   calldata: {
     type: String,
@@ -59,8 +61,12 @@ const proposalSchema = new mongoose.Schema({
   // 'custom'   = raw calldata + value set by user
   direction: {
     type: String,
-    enum: ['withdraw', 'deposit', 'custom'],
-    default: 'withdraw',
+    // 'general'  = arbitrary governance action (description + calldata only)
+    // 'withdraw' = Treasury -> Wallet (withdrawETH calldata, value=0)
+    // 'deposit'  = Wallet  -> Treasury (empty calldata, value=amountWei)
+    // 'custom'   = raw calldata + value set by user (legacy)
+    enum: ['general', 'withdraw', 'deposit', 'custom'],
+    default: 'general',
   },
   // Attached by the deposit event poller when a Deposit(from, amount) event
   // is seen on-chain. Stored even if the proposal was already EXECUTED so the

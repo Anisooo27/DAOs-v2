@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { Shield, LayoutDashboard, UserPlus, Vote, Send, Activity } from 'lucide-react';
+import { Shield, LayoutDashboard, Coins, Vote, Send, Activity } from 'lucide-react';
 import { ethers } from 'ethers';
 
 import WalletConnect from './components/WalletConnect';
@@ -25,13 +25,13 @@ const Navigation = ({ address, setAddress, setProvider, onConnect, onDisconnect 
           <span className="flex items-center gap-2"><LayoutDashboard size={18} /> Dashboard</span>
         </Link>
         <Link to="/delegate" className={`nav-link ${currentPath === '/delegate' ? 'active' : ''}`}>
-          <span className="flex items-center gap-2"><UserPlus size={18} /> Delegate</span>
+          <span className="flex items-center gap-2"><Coins size={18} /> Membership</span>
         </Link>
         <Link to="/propose" className={`nav-link ${currentPath === '/propose' ? 'active' : ''}`}>
           <span className="flex items-center gap-2"><Send size={18} /> Propose</span>
         </Link>
         <Link to="/cast-vote" className={`nav-link ${currentPath.startsWith('/cast-vote') ? 'active' : ''}`}>
-          <span className="flex items-center gap-2"><Vote size={18} /> Vote Off-Chain</span>
+          <span className="flex items-center gap-2"><Vote size={18} /> Vote</span>
         </Link>
         <Link to="/results" className={`nav-link ${currentPath.startsWith('/results') ? 'active' : ''}`}>
           <span className="flex items-center gap-2"><Activity size={18} /> Results</span>
@@ -51,31 +51,31 @@ const Dashboard = () => (
   <div className="form-container" style={{ maxWidth: '800px', textAlign: 'center' }}>
     <div className="page-header" style={{ marginBottom: '60px' }}>
       <Shield size={64} className="text-accent mx-auto mb-4" style={{ margin: '0 auto 24px' }} />
-      <h1 className="page-title" style={{ fontSize: '3.5rem', marginBottom: '24px' }}>True Off-Chain DAO</h1>
+      <h1 className="page-title" style={{ fontSize: '3.5rem', marginBottom: '24px' }}>Decentralized Governance DAO</h1>
       <p className="page-subtitle" style={{ fontSize: '1.2rem', lineHeight: 1.6 }}>
-        Gasless. Secure. Decentralized. Participate in protocol governance without paying exorbitant network fees by signing typed data directly from your wallet.
+        Decentralized. Autonomous. Transparent. Participate in governance by proposing and voting on protocol upgrades, treasury actions, and more.
       </p>
     </div>
 
     <div className="content-grid">
       <div className="glass-panel" style={{ padding: '32px' }}>
-        <h3 style={{ fontSize: '1.25rem', marginBottom: '16px', color: 'var(--text-main)' }}>Step 1: Delegate</h3>
+        <h3 style={{ fontSize: '1.25rem', marginBottom: '16px', color: 'var(--text-main)' }}>Step 1: Membership</h3>
         <p className="text-muted" style={{ marginBottom: '24px', fontSize: '0.95rem' }}>
-          Assign your voting power to yourself or another address to participate in proposals.
+          Holding GOV tokens automatically grants voting power. No delegation required.
         </p>
-        <Link to="/delegate" className="btn" style={{ width: '100%' }}>Go to Delegate</Link>
+        <Link to="/delegate" className="btn" style={{ width: '100%' }}>View Membership</Link>
       </div>
       <div className="glass-panel" style={{ padding: '32px' }}>
         <h3 style={{ fontSize: '1.25rem', marginBottom: '16px', color: 'var(--text-main)' }}>Step 2: Propose</h3>
         <p className="text-muted" style={{ marginBottom: '24px', fontSize: '0.95rem' }}>
-          Draft new protocol upgrades and submit target payloads for the community to review.
+          Draft governance proposals for treasury actions, upgrades, or protocol changes.
         </p>
         <Link to="/propose" className="btn" style={{ width: '100%' }}>Create Proposal</Link>
       </div>
       <div className="glass-panel" style={{ padding: '32px' }}>
         <h3 style={{ fontSize: '1.25rem', marginBottom: '16px', color: 'var(--text-main)' }}>Step 3: Vote</h3>
         <p className="text-muted" style={{ marginBottom: '24px', fontSize: '0.95rem' }}>
-          Cast your vote off-chain with a simple MetaMask signature. No gas required.
+          Cast your vote securely with your delegated GOV tokens.
         </p>
         <Link to="/cast-vote" className="btn btn-primary" style={{ width: '100%' }}>Cast Vote</Link>
       </div>

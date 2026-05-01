@@ -1,47 +1,21 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ethers } from 'ethers';
-import { CheckCircle, XCircle, MinusCircle, ShieldCheck, Lock } from 'lucide-react';
+import { CheckCircle, XCircle, MinusCircle, ShieldCheck, Lock, Unlock } from 'lucide-react';
 import config from '../config';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ZKP-Architecture helpers (commit-reveal scheme)
-//
-// commitment : keccak256(choice + "|" + secret + "|" + proposalId)
-//   Binds the voter cryptographically to their choice without revealing it
-//   in plain text on the wire.
-//
-// nullifier  : keccak256(voterAddress + "|" + proposalId)
-//   Unique per (voter, proposal) — the backend rejects any second submission
-//   with the same nullifier, preventing double-voting.
-//
-// In a production ZKP system (v1), a snarkjs circuit would:
-//   - Prove knowledge of `secret` s.t. commitment = keccak(choice||secret||proposalId)
-//   - Prove choice ∈ {0,1,2} without revealing it
-//   - Derive nullifier from the voter's private key (not address) so even
-//     the relayer cannot link nullifier → voter
-// ─────────────────────────────────────────────────────────────────────────────
-
-function generateSecret() {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return '0x' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function buildCommitment(choice, secret, proposalId) {
-  return ethers.keccak256(ethers.toUtf8Bytes(`${choice}|${secret}|${proposalId}`));
-}
-
-// NULLIFIER DEFINITION:  keccak256(voter | proposalId)
-//   Secret is intentionally excluded from the nullifier. The nullifier
-//   must be deterministic per (voter, proposal) regardless of what secret
-//   is generated. Regenerating the secret cannot produce a new nullifier,
-//   so one Ethereum address = exactly one vote per proposal.
-function buildNullifier(voterAddress, proposalId) {
-  return ethers.keccak256(ethers.toUtf8Bytes(`${voterAddress.toLowerCase()}|${proposalId}`));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+const GOVERNOR_ABI = [
+  'function commitVote(uint256 proposalId, bytes32 commitment) public',
+  'function revealVote(uint256 proposalId, uint8 support, string memory secret) public',
+  'function commitments(uint256 proposalId, address voter) public view returns (bytes32)',
+  'function hasRevealed(uint256 proposalId, address account) public view returns (bool)',
+  'function state(uint256 proposalId) public view returns (uint8)',
+  'function hasVoted(uint256 proposalId, address account) public view returns (bool)',
+  'event VoteCommitted(uint256 indexed proposalId, address indexed voter, bytes32 commitment)',
+  'event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 weight)',
+  'event RevealRejected(uint256 indexed proposalId, address indexed voter, string reason)',
+  'event VoteRejected(uint256 indexed proposalId, address indexed voter, string reason)'
+];
 
 const CastVote = ({ provider, address }) => {
   const [searchParams] = useSearchParams();
@@ -49,41 +23,72 @@ const CastVote = ({ provider, address }) => {
 
   const [proposalId, setProposalId] = useState(initialProposalId);
   const [choice, setChoice]         = useState(null);
-  const [isCasting, setIsCasting]   = useState(false);
+  const [secret, setSecret]         = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus]         = useState(null);
-  const [proofDetails, setProofDetails] = useState(null);
-  const [delegationStatus, setDelegationStatus] = useState(false);
-  const [votingPower, setVotingPower] = useState('0');
+  const [govBalance, setGovBalance] = useState(null);
+  const [proposalState, setProposalState] = useState(null);
+  const [isAdvancing, setIsAdvancing] = useState(false);
+  
+  const [hasCommitted, setHasCommitted] = useState(false);
+  const [hasRevealed, setHasRevealed] = useState(false);
 
   useEffect(() => {
     const fetchStatus = async () => {
       if (!address) return;
       try {
-        const configRes = await fetch('http://localhost:5000/config/contract');
-        const configData = await configRes.json();
-
-        // 1. Backend Delegation Status
-        const delRes = await fetch(`http://localhost:5000/delegation/${address}`);
-        if (delRes.ok) {
-          const delData = await delRes.json();
-          setDelegationStatus(delData.delegated);
+        const memRes = await fetch(`http://localhost:5000/membership/${address}`);
+        if (memRes.ok) {
+          const memData = await memRes.json();
+          setGovBalance(memData.govBalance ?? '0');
         }
 
-        // 2. On-chain Voting Power
+        const configRes = await fetch('http://localhost:5000/config/contract');
+        const configData = await configRes.json();
         if (provider && configData.tokenAddress) {
           const signer = await provider.getSigner();
           const tokenContract = new ethers.Contract(configData.tokenAddress, [
-            "function getVotes(address account) view returns (uint256)"
+            'function balanceOf(address account) view returns (uint256)'
           ], signer);
-          const votes = await tokenContract.getVotes(address);
-          setVotingPower(votes.toString());
+          const bal = await tokenContract.balanceOf(address);
+          setGovBalance(bal.toString());
         }
       } catch (err) {
-        console.error("Error fetching voting status:", err);
+        console.error('Error fetching voting status:', err);
       }
     };
     fetchStatus();
   }, [address, provider]);
+
+  useEffect(() => {
+    const fetchProposalState = async () => {
+      if (!provider || !proposalId.trim() || !address) {
+        setProposalState(null);
+        setHasCommitted(false);
+        setHasRevealed(false);
+        return;
+      }
+      try {
+        const configRes = await fetch('http://localhost:5000/config/contract');
+        const configData = await configRes.json();
+        const governorContract = new ethers.Contract(configData.governorAddress, GOVERNOR_ABI, provider);
+        const s = await governorContract.state(proposalId.trim());
+        setProposalState(Number(s));
+        
+        const comm = await governorContract.commitments(proposalId.trim(), address);
+        setHasCommitted(comm !== ethers.ZeroHash);
+        
+        const rev = await governorContract.hasRevealed(proposalId.trim(), address);
+        setHasRevealed(rev);
+      } catch (err) {
+        setProposalState(null);
+        console.warn('Could not fetch proposal state:', err.message);
+      }
+    };
+    fetchProposalState();
+    const interval = setInterval(fetchProposalState, 5000);
+    return () => clearInterval(interval);
+  }, [proposalId, provider, address]);
 
   const OPTIONS = [
     { id: 0, label: 'Against', icon: XCircle,      color: 'var(--danger)'     },
@@ -91,82 +96,153 @@ const CastVote = ({ provider, address }) => {
     { id: 2, label: 'Abstain', icon: MinusCircle,   color: 'var(--text-muted)' }
   ];
 
-  const handleSignAndVote = async () => {
+  const handleAdvanceToVoting = async () => {
+    try {
+      setIsAdvancing(true);
+      setStatus(null);
+      const configRes = await fetch('http://localhost:5000/config/contract');
+      const configData = await configRes.json();
+      const governorContract = new ethers.Contract(configData.governorAddress, [
+        "function votingDelay() public view returns (uint256)"
+      ], provider);
+      
+      const vDelay = await governorContract.votingDelay();
+      
+      const res = await fetch('http://localhost:5000/rpc/mine', { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blocks: Number(vDelay) + 1 })
+      });
+      if (!res.ok) throw new Error('Failed to mine blocks to advance to voting');
+      
+      setStatus({ type: 'success', message: 'Blocks mined. Voting is now active!' });
+      
+      setProposalState(1);
+    } catch (err) {
+      console.error('[advance]', err);
+      setStatus({ type: 'error', message: err.message });
+    } finally {
+      setIsAdvancing(false);
+    }
+  };
+
+  const handleCommitVote = async () => {
     if (!address) { alert('Please connect your wallet first.'); return; }
-    if (!proposalId.trim() || choice === null) {
-      alert('Please enter a Proposal ID and select a voting option.');
+    if (!proposalId.trim() || choice === null || !secret.trim()) {
+      alert('Please enter a Proposal ID, select a choice, and provide a secret phrase.');
       return;
     }
 
     try {
-      setIsCasting(true);
+      setIsProcessing(true);
       setStatus(null);
-      setProofDetails(null);
 
       const signer = await provider.getSigner();
-
-      // ── Step 1: Generate cryptographic proof components ─────────────────
-      const secret     = generateSecret();
-      const commitment = buildCommitment(choice, secret, proposalId.trim());
-      const nullifier  = buildNullifier(address, proposalId.trim());
-
-      console.log('[zkp] Secret:     ', secret);
-      console.log('[zkp] Commitment: ', commitment);
-      console.log('[zkp] Nullifier:  ', nullifier);
-
-      // ── Step 2: Sign the commitment (proves voter created this commitment) ─
-      const signedMessage = `${commitment}|${proposalId.trim()}`;
-      const signature = await signer.signMessage(signedMessage);
-
-      console.log('[zkp] Signature:  ', signature);
-
-      // ── Step 3: Submit to backend ────────────────────────────────────────
-      const response = await fetch(config.VOTE_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          proposalId: proposalId.trim(),
-          voter:      address,
-          choice,
-          commitment,
-          nullifier,
-          secret,
-          signature
-        })
-      });
-
-      const data = await response.json();
-
-      if (response.ok) {
-        setStatus({ type: 'success', message: '🔒 Vote secured and recorded with cryptographic proof.' });
-        setProofDetails({
-          commitment:      commitment.slice(0, 20) + '…',
-          nullifier:       (data.nullifier || buildNullifier(address, proposalId.trim())).slice(0, 20) + '…',
-          zkProofVersion:  data.zkProofVersion || 'v0-commit-reveal',
-          secured:         data.secured
-        });
-      } else if (response.status === 409) {
-        // Already voted — show distinct state, not a generic error
-        setStatus({ type: 'duplicate', message: data.error || 'Already voted for this proposal.' });
-        setProofDetails(null);
-      } else {
-        setStatus({ type: 'error', message: data.error || 'Failed to record vote.' });
+      const configRes = await fetch('http://localhost:5000/config/contract');
+      const configData = await configRes.json();
+      
+      const governorContract = new ethers.Contract(configData.governorAddress, GOVERNOR_ABI, signer);
+      
+      const state = await governorContract.state(proposalId.trim());
+      if (Number(state) === 0) {
+        throw new Error("Voting not yet active, advance blocks.");
+      } else if (Number(state) !== 1) {
+        throw new Error(`Voting is not active for this proposal. State: ${state}`);
       }
 
+      // Generate commitment: keccak256(walletAddress + proposalId + choice + secret)
+      const commitment = ethers.solidityPackedKeccak256(
+        ['address', 'uint256', 'uint8', 'string'],
+        [address, proposalId.trim(), choice, secret]
+      );
+
+      setStatus({ type: 'info', message: 'Waiting for commit transaction confirmation...' });
+      const tx = await governorContract.commitVote(proposalId.trim(), commitment);
+      await tx.wait();
+
+      setStatus({ type: 'success', message: '✅ Your vote has been committed. Hidden until reveal.' });
+      setHasCommitted(true);
+      setSecret(''); // Force re-entry for reveal
     } catch (error) {
-      console.error('[zkp] Error casting vote:', error);
-      setStatus({ type: 'error', message: error.message || 'Error signing or submitting vote.' });
+      console.error('[commit] Error:', error);
+      const errMsg = error.reason || error.message || '';
+      if (errMsg.toLowerCase().includes('already committed')) {
+        setStatus({ type: 'error', message: '⚠️ You have already committed a vote.' });
+        try {
+          await fetch('http://localhost:5000/rpc/log-vote-error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ wallet: address, proposalId: proposalId.trim(), errorType: 'duplicate' })
+          });
+        } catch (e) {}
+      } else {
+        setStatus({ type: 'error', message: error.message || 'Error committing vote.' });
+      }
     } finally {
-      setIsCasting(false);
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRevealVote = async () => {
+    if (!address) { alert('Please connect your wallet first.'); return; }
+    
+    // Requirement: If secret field is empty → block reveal and show warning
+    if (!secret.trim()) {
+      setStatus({ type: 'warning', message: 'Please enter your secret phrase to reveal your vote.' });
+      return;
+    }
+
+    if (!proposalId.trim() || choice === null) {
+      alert('Please select your choice.');
+      return;
+    }
+
+    try {
+      setIsProcessing(true);
+      setStatus(null);
+
+      const signer = await provider.getSigner();
+      const configRes = await fetch('http://localhost:5000/config/contract');
+      const configData = await configRes.json();
+      
+      const governorContract = new ethers.Contract(configData.governorAddress, GOVERNOR_ABI, signer);
+
+      setStatus({ type: 'info', message: 'Waiting for reveal transaction confirmation...' });
+      
+      // Simulate transaction first to catch Invalid reveal
+      try {
+        await governorContract.revealVote.staticCall(proposalId.trim(), choice, secret);
+      } catch (staticErr) {
+         console.warn("Static call failed, reveal might fail");
+      }
+      
+      const tx = await governorContract.revealVote(proposalId.trim(), choice, secret);
+      const receipt = await tx.wait();
+
+      // Check logs for RevealRejected
+      const rejectedTopic = governorContract.interface.getEvent('RevealRejected').topicHash;
+      const wasRejected = receipt.logs.some(log => log.topics[0] === rejectedTopic);
+
+      if (wasRejected) {
+        setStatus({ type: 'error', message: '⛔ Reveal failed — secret does not match commitment.' });
+      } else {
+        setStatus({ type: 'success', message: '✅ Your vote has been revealed and tallied.' });
+        setHasRevealed(true);
+      }
+    } catch (error) {
+      console.error('[reveal] Error:', error);
+      setStatus({ type: 'error', message: error.reason || error.message || 'Error revealing vote.' });
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   return (
     <div className="form-container">
       <div className="page-header">
-        <h1 className="page-title">Cast Off-Chain Vote</h1>
+        <h1 className="page-title">Cast On-Chain Vote</h1>
         <p className="page-subtitle">
-          Your vote is secured with a cryptographic commitment — gasless, signed, and double-vote protected.
+          Secure your ballot with a Commit-Reveal scheme. Hide your vote until the reveal phase.
         </p>
       </div>
 
@@ -184,8 +260,46 @@ const CastVote = ({ provider, address }) => {
           />
         </div>
 
-        <label className="form-label mb-4" style={{ display: 'block' }}>Select your choice:</label>
+        {proposalState === 0 && (
+          <div style={{ marginBottom: '16px', padding: '16px', background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: '8px', color: '#fbbf24' }}>
+            <p style={{ fontWeight: 600, marginBottom: '8px' }}>⏳ Proposal pending, advance blocks to activate.</p>
+            <button 
+              onClick={handleAdvanceToVoting} 
+              disabled={isAdvancing}
+              className="btn btn-primary" 
+              style={{ padding: '8px 16px', fontSize: '0.9rem', width: 'auto' }}
+            >
+              {isAdvancing ? 'Advancing...' : '⏩ Advance to Voting'}
+            </button>
+          </div>
+        )}
+        
+        {hasCommitted && !hasRevealed && (
+          <div style={{ marginBottom: '16px', padding: '16px', background: 'rgba(56,189,248,0.1)', border: '1px solid rgba(56,189,248,0.3)', borderRadius: '8px', color: 'var(--accent-primary)' }}>
+            <p style={{ fontWeight: 600, margin: 0 }}>🔒 Your vote has been committed. Hidden until reveal.</p>
+          </div>
+        )}
 
+        {hasRevealed && (
+          <div style={{ marginBottom: '16px', padding: '16px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '8px', color: 'var(--success)' }}>
+            <p style={{ fontWeight: 600, margin: 0 }}>✅ Your vote has been revealed and tallied.</p>
+          </div>
+        )}
+
+        <div className="form-group mb-4">
+          <label className="form-label">Secret Phrase</label>
+          <input
+            type="text"
+            className="form-input"
+            style={{ fontSize: '0.95rem', padding: '14px' }}
+            placeholder="Enter a secret phrase for your vote"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+            disabled={hasRevealed}
+          />
+        </div>
+
+        <label className="form-label mb-4" style={{ display: 'block' }}>Select your choice:</label>
         <div className="content-grid mb-4" style={{ gap: '16px', gridTemplateColumns: 'repeat(3, 1fr)' }}>
           {OPTIONS.map(opt => {
             const Icon = opt.icon;
@@ -196,6 +310,7 @@ const CastVote = ({ provider, address }) => {
                 type="button"
                 onClick={() => setChoice(opt.id)}
                 className="btn"
+                disabled={(proposalState !== 1 && proposalState !== null) || hasRevealed}
                 style={{
                   display: 'flex', flexDirection: 'column', padding: '24px 16px', height: 'auto',
                   background: isSelected
@@ -205,6 +320,8 @@ const CastVote = ({ provider, address }) => {
                   color:       isSelected ? opt.color : 'var(--text-main)',
                   transform:   isSelected ? 'translateY(-2px)' : 'none',
                   boxShadow:   isSelected ? `0 4px 12px rgba(${opt.color === 'var(--success)' ? '16, 185, 129' : opt.color === 'var(--danger)' ? '239, 68, 68' : '148, 163, 184'}, 0.2)` : 'none',
+                  opacity:     (proposalState !== 1 && proposalState !== null) || hasRevealed ? 0.5 : 1,
+                  cursor:      (proposalState !== 1 && proposalState !== null) || hasRevealed ? 'not-allowed' : 'pointer'
                 }}
               >
                 <Icon size={28} style={{ marginBottom: '12px', color: isSelected ? opt.color : 'var(--text-muted)' }} />
@@ -214,32 +331,32 @@ const CastVote = ({ provider, address }) => {
           })}
         </div>
 
-        {/* ZKP Info Banner */}
-        <div className="glass-panel mt-4 mb-4" style={{ background: 'rgba(0, 255, 136, 0.03)', padding: '16px', borderColor: 'rgba(0,255,136,0.15)' }}>
-          <div className="flex items-center gap-2 mb-2" style={{ color: 'var(--accent-primary)' }}>
-            <Lock size={16} />
-            <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>🔒 Cryptographic Vote Security</span>
-          </div>
-          <p className="text-muted" style={{ fontSize: '0.82rem', lineHeight: 1.6 }}>
-            Your vote generates a <strong>commitment</strong> (binds you to your choice) and a <strong>nullifier</strong> (prevents double-voting).
-            You sign the commitment with MetaMask — not the raw choice. The backend verifies all three layers before recording your vote.
-          </p>
-          <p className="text-muted" style={{ fontSize: '0.78rem', marginTop: '6px', opacity: 0.7 }}>
-            Protocol: <code>v0-commit-reveal</code> — ZKP circuit upgrade path: replace commitment hash with snarkjs Groth16 proof (v1).
-          </p>
+        <div style={{ display: 'flex', gap: '16px' }}>
+          <button
+            onClick={handleCommitVote}
+            className="btn btn-primary"
+            style={{ flex: 1, padding: '16px', fontSize: '1.05rem', opacity: (!address || !govBalance || govBalance === '0' || proposalState !== 1 || hasCommitted) ? 0.6 : 1 }}
+            disabled={isProcessing || choice === null || !secret.trim() || !proposalId || !address || !govBalance || govBalance === '0' || proposalState !== 1 || hasCommitted}
+          >
+            <Lock size={18} style={{ marginRight: '8px' }} />
+            {isProcessing && !hasCommitted ? 'Committing…' : hasCommitted ? 'Vote Committed' : 'Step 1: Commit Vote'}
+          </button>
+
+          <button
+            onClick={handleRevealVote}
+            className="btn"
+            style={{ 
+              flex: 1, padding: '16px', fontSize: '1.05rem', 
+              background: 'var(--accent-primary)', color: 'white', border: 'none',
+              opacity: (!hasCommitted || hasRevealed || isProcessing || proposalState !== 1) ? 0.6 : 1 
+            }}
+            disabled={!hasCommitted || hasRevealed || isProcessing || proposalState !== 1 || choice === null}
+          >
+            <Unlock size={18} style={{ marginRight: '8px' }} />
+            {isProcessing && hasCommitted ? 'Revealing…' : hasRevealed ? 'Vote Revealed' : 'Step 2: Reveal Vote'}
+          </button>
         </div>
 
-        <button
-          onClick={handleSignAndVote}
-          className="btn btn-primary"
-          style={{ width: '100%', padding: '16px', fontSize: '1.05rem', opacity: (!address || !delegationStatus || votingPower === '0') ? 0.6 : 1 }}
-          disabled={isCasting || choice === null || !proposalId || !address || !delegationStatus || votingPower === '0'}
-        >
-          <ShieldCheck size={18} style={{ marginRight: '8px' }} />
-          {isCasting ? 'Generating proof & waiting for signature…' : !address ? 'Please connect a wallet to continue' : (!delegationStatus || votingPower === '0') ? 'No Voting Power / Not Delegated' : 'Generate Proof & Submit Vote'}
-        </button>
-
-        {/* What happens next — lifecycle explainer */}
         <div style={{
           marginTop: '16px', padding: '12px 16px',
           background: 'rgba(56,189,248,0.06)',
@@ -247,11 +364,10 @@ const CastVote = ({ provider, address }) => {
           borderRadius: '8px', fontSize: '0.82rem', color: 'var(--text-muted)',
           lineHeight: 1.6
         }}>
-          <p style={{ fontWeight: 700, color: 'var(--accent-primary)', marginBottom: '4px' }}>📋 What happens next?</p>
+          <p style={{ fontWeight: 700, color: 'var(--accent-primary)', marginBottom: '4px' }}>📋 How Commit-Reveal Works</p>
           <ol style={{ paddingLeft: '18px', margin: 0 }}>
-            <li>Your vote is recorded in the backend during the <strong>Active</strong> voting window.</li>
-            <li>Once all votes are cast, go to <strong>Voting Results</strong> and click <strong>"Push Tally"</strong> to close the window and determine the outcome.</li>
-            <li>If the proposal <strong>Succeeded</strong>, click <strong>"Queue & Execute"</strong> to finalise on-chain.</li>
+            <li><strong>Commit:</strong> Submit a secure hash of your vote and secret. Your choice remains completely hidden on-chain.</li>
+            <li><strong>Reveal:</strong> Provide the same choice and secret. The contract verifies your commitment and tallies your vote.</li>
           </ol>
         </div>
 
@@ -260,46 +376,28 @@ const CastVote = ({ provider, address }) => {
             className="glass-panel mt-4"
             style={{
               background:   status.type === 'success'   ? 'rgba(16, 185, 129, 0.05)'
+                          : status.type === 'info'      ? 'rgba(56, 189, 248, 0.05)'
+                          : status.type === 'warning'   ? 'rgba(251, 191, 36, 0.05)'
                           : status.type === 'duplicate' ? 'rgba(234, 179, 8, 0.05)'
                           : 'rgba(239, 68, 68, 0.05)',
               borderColor:  status.type === 'success'   ? 'rgba(16, 185, 129, 0.2)'
+                          : status.type === 'info'      ? 'rgba(56, 189, 248, 0.2)'
+                          : status.type === 'warning'   ? 'rgba(251, 191, 36, 0.3)'
                           : status.type === 'duplicate' ? 'rgba(234, 179, 8, 0.25)'
                           : 'rgba(239, 68, 68, 0.2)'
             }}
           >
             <h4 style={{
               color: status.type === 'success'   ? 'var(--success)'
+                   : status.type === 'info'      ? 'var(--accent-primary)'
+                   : status.type === 'warning'   ? '#fbbf24'
                    : status.type === 'duplicate' ? '#eab308'
                    : 'var(--danger)',
               marginBottom: '8px'
             }}>
-              {status.type === 'success' ? '✅ Vote Recorded' : status.type === 'duplicate' ? '⛔ Already Voted' : '❌ Error'}
+              {status.type === 'success' ? '✅ Success' : status.type === 'info' ? 'ℹ️ Info' : status.type === 'warning' ? '⚠️ Warning' : status.type === 'duplicate' ? '⛔ Duplicate' : '❌ Error'}
             </h4>
             <div style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>{status.message}</div>
-            {status.type === 'duplicate' && (
-              <p style={{ fontSize: '0.8rem', marginTop: '8px', color: 'rgba(234,179,8,0.8)' }}>
-                Each Ethereum address may cast exactly one vote per proposal. Regenerating the secret does not allow a second vote.
-              </p>
-            )}
-
-            {/* Proof Details */}
-            {proofDetails && (
-              <div style={{ marginTop: '12px', padding: '10px', background: 'rgba(0,255,136,0.04)', borderRadius: '6px', border: '1px solid rgba(0,255,136,0.12)' }}>
-                <p style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--accent-primary)', marginBottom: '6px' }}>
-                  🔐 Cryptographic Proof Details
-                </p>
-                <table style={{ width: '100%', fontSize: '0.76rem', borderCollapse: 'collapse' }}>
-                  <tbody>
-                    <tr><td style={{ color: 'var(--text-muted)', paddingRight: '12px', paddingBottom: '4px' }}>Commitment</td>
-                        <td style={{ fontFamily: 'monospace', color: 'var(--text-main)' }}>{proofDetails.commitment}</td></tr>
-                    <tr><td style={{ color: 'var(--text-muted)', paddingBottom: '4px' }}>Nullifier</td>
-                        <td style={{ fontFamily: 'monospace', color: 'var(--text-main)' }}>{proofDetails.nullifier}</td></tr>
-                    <tr><td style={{ color: 'var(--text-muted)', paddingBottom: '4px' }}>Protocol</td>
-                        <td style={{ color: 'var(--accent-secondary)' }}>{proofDetails.zkProofVersion}</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            )}
           </div>
         )}
 

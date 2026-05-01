@@ -90,39 +90,20 @@ async function main() {
     console.log('[2/4] Target IS deployer — skipping transfer.');
   }
 
-  // ── 3. Ensure deployer self-delegates (so auto-tally relayer can vote) ─────
-  const deployerVotes = await token.getVotes(deployer.address);
-  if (deployerVotes === 0n) {
-    console.log('[3/4] Deployer has 0 votes — self-delegating so the relayer backend can vote...');
-    const delTx = await token.delegate(deployer.address);
-    await delTx.wait();
-    console.log(`[3/4] ✅ Deployer self-delegation confirmed. Tx: ${delTx.hash}`);
-  } else {
-    console.log(`[3/4] Deployer already has ${ethers.formatEther(deployerVotes)} votes — skipping.`);
-  }
-
-  // ── 4. Print summary ───────────────────────────────────────────────────────
-  const targetBalance   = await token.balanceOf(target);
-  const targetVotes     = await token.getVotes(target);
-  const deployerVotesNow = await token.getVotes(deployer.address);
+  // ── 3. Print summary ──────────────────────────────────────────────────────
+  const targetBalance    = await token.balanceOf(target);
+  const deployerBalance2 = await token.balanceOf(deployer.address);
 
   console.log('\n─────────────────────────────────────────────────────');
   console.log('  Results');
   console.log('─────────────────────────────────────────────────────');
   console.log(`  Target balance:   ${ethers.formatEther(targetBalance)} GOV`);
-  console.log(`  Target votes:     ${ethers.formatEther(targetVotes)} (on-chain)`);
-  console.log(`  Deployer votes:   ${ethers.formatEther(deployerVotesNow)} (on-chain)`);
+  console.log(`  Voting power:     ${ethers.formatEther(targetBalance)} GOV  (= balance, no delegation needed)`);
+  console.log(`  Deployer balance: ${ethers.formatEther(deployerBalance2)} GOV`);
   console.log('─────────────────────────────────────────────────────');
-
-  if (targetVotes === 0n) {
-    console.log('\n[4/4] ⚠️  Target has GOV tokens but 0 on-chain votes.');
-    console.log('         The target wallet must self-delegate via MetaMask.');
-    console.log('         → Open the DAO frontend → Delegate Votes → click "Delegate Votes".');
-  } else {
-    console.log('\n[4/4] ✅ Setup complete. Target wallet is ready to propose and vote.');
-  }
-
-  console.log(`\nNext: connect ${target} in MetaMask and navigate to the Delegate Votes page.\n`);
+  console.log(`\n[3/3] ✅ Setup complete. Target wallet can immediately propose and vote.`);
+  console.log(`       Voting power = GOV balance. No delegate() call needed.`);
+  console.log(`\nNext: connect ${target} in MetaMask and navigate to the Propose or Vote page.\n`);
 }
 
 main().catch((err) => {
