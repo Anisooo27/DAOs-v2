@@ -106,7 +106,7 @@ app.post('/rpc/mine', async (req, res) => {
             console.log(`\n[EVENT] ProposalSucceeded: ${shortId} - majority For and quorum met`);
           }
         } catch (e) {
-          console.warn('[RPC] Could not check proposal state:', e.message);
+          console.error(`[ERROR] Proposal state check failed for ${proposalId}`);
         }
       }
     }
@@ -137,39 +137,88 @@ if (require.main === module) {
     const evtProvider = new ethers.JsonRpcProvider(RPC_URL);
     const governorContract = new ethers.Contract(liveGovernorAddress, GOVERNOR_ABI, evtProvider);
     
+    // ── Safe event iterator guard ─────────────────────────────────────────
+    // Wraps raw results from FilterIdEventSubscriber._emitResults so that a
+    // null / non-array payload never propagates as a TypeError crash.
+    function safeIterate(results, handler, eventName) {
+      try {
+        if (!results || !Array.isArray(results)) { return; }
+        results.forEach(handler);
+      } catch (err) {
+        console.error(`[ERROR] EventSubscriber failed for ${eventName} — skipping iteration`);
+      }
+    }
+
     // Clean logging of Governor events
-    governorContract.on('ProposalCreated', (proposalId, proposer, targets, values, signatures, calldatas, startBlock, endBlock, description, event) => {
-      console.log(`\n[EVENT] ProposalCreated: ${proposalId.toString().slice(0, 15)}...`);
-      console.log(`   Proposer: ${proposer}`);
-      console.log(`   CID: ${description}`);
+    governorContract.on('ProposalCreated', (...args) => {
+      try {
+        const [proposalId, proposer,,,,,,,description] = args;
+        console.log(`\n[EVENT] ProposalCreated: ${proposalId.toString().slice(0, 15)}...`);
+        console.log(`   Proposer: ${proposer}`);
+        console.log(`   CID: ${description}`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for ProposalCreated — skipping iteration');
+      }
     });
 
-    governorContract.on('VoteCast', (voter, proposalId, support, weight, reason, event) => {
-      const supportLabel = support === 0n ? 'Against' : support === 1n ? 'For' : 'Abstain';
-      console.log(`\n[EVENT] VoteCast: ${voter} voted ${supportLabel} (weight: ${ethers.formatEther(weight)})`);
-      console.log(`   Proposal ID: ${proposalId.toString().slice(0, 15)}...`);
+    governorContract.on('VoteCast', (...args) => {
+      try {
+        const [voter, proposalId, support, weight] = args;
+        const supportLabel = support === 0n ? 'Against' : support === 1n ? 'For' : 'Abstain';
+        console.log(`\n[EVENT] VoteCast: ${voter} voted ${supportLabel} (weight: ${ethers.formatEther(weight)})`);
+        console.log(`   Proposal ID: ${proposalId.toString().slice(0, 15)}...`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for VoteCast — skipping iteration');
+      }
     });
 
-    governorContract.on('VoteCommitted', (proposalId, voter, commitment, event) => {
-      console.log(`\n[EVENT] VoteCommitted: ${proposalId.toString()} by ${voter} (${commitment})`);
+    governorContract.on('VoteCommitted', (...args) => {
+      try {
+        const [proposalId, voter, commitment] = args;
+        console.log(`\n[EVENT] VoteCommitted: ${proposalId.toString()} by ${voter} (${commitment})`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for VoteCommitted — skipping iteration');
+      }
     });
 
-    governorContract.on('VoteRevealed', (proposalId, voter, support, weight, event) => {
-      const supportLabel = support === 0n ? 'Against' : support === 1n ? 'For' : 'Abstain';
-      console.log(`\n[EVENT] VoteRevealed: ${proposalId.toString()} choice=${supportLabel} by ${voter}`);
+    governorContract.on('VoteRevealed', (...args) => {
+      try {
+        const [proposalId, voter, support, weight] = args;
+        const supportLabel = support === 0n ? 'Against' : support === 1n ? 'For' : 'Abstain';
+        console.log(`\n[EVENT] VoteRevealed: ${proposalId.toString()} choice=${supportLabel} by ${voter}`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for VoteRevealed — skipping iteration');
+      }
     });
 
-    governorContract.on('RevealRejected', (proposalId, voter, reason, event) => {
-      console.log(`\n[EVENT] RevealRejected: ${proposalId.toString()} by ${voter} (${reason})`);
+    governorContract.on('RevealRejected', (...args) => {
+      try {
+        const [proposalId, voter, reason] = args;
+        console.log(`\n[EVENT] RevealRejected: ${proposalId.toString()} by ${voter} (${reason})`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for RevealRejected — skipping iteration');
+      }
     });
 
-    governorContract.on('VoteRejected', (proposalId, voter, reason, event) => {
-      console.log(`\n[EVENT] VoteRejected: ${proposalId.toString()} by ${voter} (${reason})`);
+    governorContract.on('VoteRejected', (...args) => {
+      try {
+        const [proposalId, voter, reason] = args;
+        console.log(`\n[EVENT] VoteRejected: ${proposalId.toString()} by ${voter} (${reason})`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for VoteRejected — skipping iteration');
+      }
     });
 
-    governorContract.on('ProposalExecuted', (proposalId, event) => {
-      console.log(`\n[EVENT] ProposalExecuted: ${proposalId.toString().slice(0, 15)}...`);
-      console.log(`   Execution completed successfully on-chain!`);
+    // The OpenZeppelin Governor does NOT emit ProposalDefeated natively;
+    // we detect it via /rpc/mine state check.
+    governorContract.on('ProposalExecuted', (...args) => {
+      try {
+        const [proposalId] = args;
+        console.log(`\n[EVENT] ProposalExecuted: ${proposalId.toString().slice(0, 15)}...`);
+        console.log(`   Execution completed successfully on-chain!`);
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for ProposalExecuted — skipping iteration');
+      }
     });
 
     console.log('[on-chain] Listening for Governor events on ' + liveGovernorAddress);
@@ -179,12 +228,17 @@ if (require.main === module) {
     const evtProvider = new ethers.JsonRpcProvider(RPC_URL);
     const TOKEN_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
     const tokenContract = new ethers.Contract(freshAddrs.tokenAddress, TOKEN_ABI, evtProvider);
-    tokenContract.on('Transfer', (from, to, value) => {
-      const amount = ethers.formatEther(value);
-      if (from === ethers.ZeroAddress) {
-        console.log(`\n[EVENT] FaucetMint: ${amount} GOV minted to ${to}`);
-      } else {
-        console.log(`\n[EVENT] Transfer: ${amount} GOV from ${from} to ${to}`);
+    tokenContract.on('Transfer', (...args) => {
+      try {
+        const [from, to, value] = args;
+        const amount = ethers.formatEther(value);
+        if (from === ethers.ZeroAddress) {
+          console.log(`\n[EVENT] FaucetMint: ${amount} GOV minted to ${to}`);
+        } else {
+          console.log(`\n[EVENT] Transfer: ${amount} GOV from ${from} to ${to}`);
+        }
+      } catch (err) {
+        console.error('[ERROR] EventSubscriber failed for Transfer — skipping iteration');
       }
     });
     console.log('[on-chain] Listening for Transfer events on ' + freshAddrs.tokenAddress);
