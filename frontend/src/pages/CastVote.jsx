@@ -12,7 +12,7 @@ const GOVERNOR_ABI = [
   'function state(uint256 proposalId) public view returns (uint8)',
   'function hasVoted(uint256 proposalId, address account) public view returns (bool)',
   'event VoteCommitted(uint256 indexed proposalId, address indexed voter, bytes32 commitment)',
-  'event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 weight)',
+  'event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 quadraticWeight)',
   'event RevealRejected(uint256 indexed proposalId, address indexed voter, string reason)',
   'event VoteRejected(uint256 indexed proposalId, address indexed voter, string reason)'
 ];
@@ -32,6 +32,28 @@ const CastVote = ({ provider, address }) => {
   
   const [hasCommitted, setHasCommitted] = useState(false);
   const [hasRevealed, setHasRevealed] = useState(false);
+
+  const getQuadraticWeight = (bal) => {
+    if (!bal || bal === '0') return '0';
+    try {
+      const b = BigInt(bal);
+      const sqrt = (value) => {
+        if (value < 0n) return null;
+        if (value < 2n) return value;
+        let x = value / 2n + 1n;
+        let y = (x + value / x) / 2n;
+        while (y < x) {
+          x = y;
+          y = (x + value / x) / 2n;
+        }
+        return x;
+      };
+      const weightWei = sqrt(b * BigInt(10**18));
+      return ethers.formatUnits(weightWei, 18);
+    } catch (e) {
+      return '0';
+    }
+  };
 
   useEffect(() => {
     const fetchStatus = async () => {
@@ -226,7 +248,11 @@ const CastVote = ({ provider, address }) => {
       if (wasRejected) {
         setStatus({ type: 'error', message: '⛔ Reveal failed — secret does not match commitment.' });
       } else {
-        setStatus({ type: 'success', message: '✅ Your vote has been revealed and tallied.' });
+        const qWeight = getQuadraticWeight(govBalance);
+        setStatus({ 
+          type: 'success', 
+          message: `✅ Your vote has been revealed and tallied with quadratic weight. Your vote counted with weight = ${qWeight}.` 
+        });
         setHasRevealed(true);
       }
     } catch (error) {
@@ -282,7 +308,8 @@ const CastVote = ({ provider, address }) => {
 
         {hasRevealed && (
           <div style={{ marginBottom: '16px', padding: '16px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '8px', color: 'var(--success)' }}>
-            <p style={{ fontWeight: 600, margin: 0 }}>✅ Your vote has been revealed and tallied.</p>
+            <p style={{ fontWeight: 600, margin: 0 }}>✅ Your vote has been revealed and tallied with quadratic weight.</p>
+            <p style={{ fontSize: '0.85rem', marginTop: '4px', opacity: 0.9 }}>Your vote counted with weight = {getQuadraticWeight(govBalance)} (√balance).</p>
           </div>
         )}
 

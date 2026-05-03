@@ -17,6 +17,7 @@ import "@openzeppelin/contracts/governance/TimelockController.sol";
 
 // ---------------- ERC20 (for balanceOf) ----------------
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract DAOGovernor is
     Governor,
@@ -32,7 +33,7 @@ contract DAOGovernor is
     mapping(uint256 => mapping(address => bool)) public hasRevealed;
 
     event VoteCommitted(uint256 indexed proposalId, address indexed voter, bytes32 commitment);
-    event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 weight);
+    event VoteRevealed(uint256 indexed proposalId, address indexed voter, uint8 support, uint256 quadraticWeight);
     event RevealRejected(uint256 indexed proposalId, address indexed voter, string reason);
     event VoteRejected(uint256 indexed proposalId, address indexed voter, string reason);
 
@@ -85,7 +86,12 @@ contract DAOGovernor is
         uint256 /* blockNumber */,
         bytes memory /* params */
     ) internal view override(Governor, GovernorVotes) returns (uint256) {
-        return IERC20(address(token)).balanceOf(account);
+        uint256 balance = IERC20(address(token)).balanceOf(account);
+        if (balance == 0) return 0;
+        // Quadratic Weight: sqrt(balance * 1e18)
+        // This ensures 1 GOV (1e18 wei) -> 1e18 weight
+        // 4 GOV (4e18 wei) -> 2e18 weight
+        return Math.sqrt(balance * 10**18);
     }
 
     // --------------------------------------------------
@@ -302,7 +308,7 @@ contract DAOGovernor is
         }
         
         hasRevealed[proposalId][msg.sender] = true;
-        uint256 weight = _castVote(proposalId, msg.sender, support, "");
-        emit VoteRevealed(proposalId, msg.sender, support, weight);
+        uint256 quadraticWeight = _castVote(proposalId, msg.sender, support, "");
+        emit VoteRevealed(proposalId, msg.sender, support, quadraticWeight);
     }
 }

@@ -183,9 +183,9 @@ if (require.main === module) {
 
     governorContract.on('VoteRevealed', (...args) => {
       try {
-        const [proposalId, voter, support, weight] = args;
+        const [proposalId, voter, support, quadraticWeight] = args;
         const supportLabel = support === 0n ? 'Against' : support === 1n ? 'For' : 'Abstain';
-        console.log(`\n[EVENT] VoteRevealed: ${proposalId.toString()} choice=${supportLabel} by ${voter}`);
+        console.log(`\n[EVENT] VoteRevealed: ${proposalId.toString()} choice=${supportLabel} by ${voter} (quadraticWeight=${ethers.formatEther(quadraticWeight)})`);
       } catch (err) {
         console.error('[ERROR] EventSubscriber failed for VoteRevealed — skipping iteration');
       }
